@@ -183,6 +183,9 @@ cython_debug/
 *.sqlite3
 *.bin
 
+# Qdrant local storage
+/qdrant_data/
+
 # Private Credentials, ignore everything in the folder but the .gitkeep file
 privatecredentials/*
 !privatecredentials/.gitkeep
