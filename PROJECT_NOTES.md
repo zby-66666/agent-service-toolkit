@@ -5,10 +5,11 @@
 ```text
 Phase 1：✅ 已完成（2026-08-18）
 Phase 2：✅ 已完成（2026-08-23）
-Phase 3～14：未开始
+Phase 3：✅ 已完成（2026-08-24）
+Phase 4～14：未开始
 ```
 
-当前阶段边界：已经完成原项目运行验证和核心调用链阅读，尚未修改核心业务代码，也尚未开始研究或改造 RAG。
+当前阶段边界：已经完成原项目运行验证、核心调用链和原版 RAG 阅读，尚未修改核心业务代码，也尚未开始 Vector Store 改造。
 
 ## 项目基线
 
@@ -236,6 +237,103 @@ data: [DONE]
 - `message_generator()`：筛选事件并包装成 `token` / `message` SSE。
 - `StreamingResponse`：通过 HTTP 把 SSE 逐条发送给客户端。
 
+## Phase 3：原项目 RAG 调用链
+
+### 1. 核心文件与职责
+
+- `scripts/create_chroma_db.py`：离线读取文档、切块、生成向量并建立 Chroma。
+- `src/agents/tools.py`：在线加载 Chroma、创建 Retriever 并真正执行检索。
+- `src/agents/rag_assistant.py`：定义 RAG Agent Graph，让模型决定是否调用检索工具，并根据检索结果回答。
+- 当前版本没有计划中提到的 `src/core/vector_store.py`，应以实际项目结构为准。
+
+### 2. 离线建库
+
+```text
+./data 中的 PDF / DOCX
+↓
+根据扩展名选择 PyPDFLoader / Docx2txtLoader
+↓
+loader.load()
+↓
+list[Document]
+↓
+RecursiveCharacterTextSplitter
+↓
+list[Document]（Chunk）
+↓
+Chroma.add_documents()
+↓
+OpenAIEmbeddings 在内部生成文档向量
+↓
+保存向量、page_content 和 metadata 到 ./chroma_db
+```
+
+- `Document` 主要包含正文 `page_content` 和来源、页码等 `metadata`。
+- 当前默认 `chunk_size=2000`、`chunk_overlap=500`。
+- overlap 用于减少语义在 Chunk 边界处被切断的问题，但过大会增加重复内容、Embedding 成本和存储。
+- 当前源文档 `data/AcmeTech_Employee_Handbook.pdf` 已存在，但还没有生成 `chroma_db`。
+
+### 3. Embedding、Vector Store 与 Chat Model
+
+- Chat Model：`qwen3:4b`，负责理解问题、决定是否调用工具、读取检索结果并生成答案。
+- Embedding Model：原项目使用 `OpenAIEmbeddings`，负责将 Chunk 和查询转换成向量，不生成答案。
+- Vector Store：Chroma，负责保存文档向量、正文和 metadata，并执行相似度检索。
+- 文档和查询必须使用兼容的同一个 Embedding 模型，才能处于可比较的向量空间。
+- 将员工手册写入 Chroma 不会训练或修改 Qwen3；RAG 只是把检索内容临时放入本次模型上下文。
+
+### 4. 在线检索
+
+```text
+第一次 model 生成 AIMessage(tool_calls=[Database_Search])
+↓
+pending_tool_calls() 路由到 tools
+↓
+ToolNode 调用 database_search_func(query)
+↓
+load_chroma_db()
+↓
+创建 OpenAIEmbeddings、Chroma 和 Retriever（k=5）
+↓
+retriever.invoke(query)
+↓
+list[Document]
+↓
+format_contexts(documents)
+↓
+context_str
+↓
+ToolNode 包装成 ToolMessage
+↓
+第二次 model 根据检索内容生成最终 AIMessage
+↓
+END
+```
+
+- `k=5` 表示最多返回相似度排名最高的 5 个 Chunk，不是返回 5 个答案。
+- `database_search_func()` 返回普通字符串；`ToolNode` 负责包装成 `ToolMessage` 并关联 `tool_call_id`。
+- 当前流程由模型决定是否调用 `Database_Search`，因此属于 Agentic RAG，而不是程序强制每次检索。
+
+### 5. 当前运行条件
+
+只读检查结果：
+
+```text
+data_exists=True
+chroma_db_exists=False
+openai_key_configured=False
+```
+
+因此原版 RAG 当前不能直接运行：已有员工手册 PDF，但没有 `OPENAI_API_KEY`，也没有完成向量化后的 `chroma_db`。Phase 3 的目标是理解原项目，所以没有提前修改为本地 `bge-m3`。
+
+### 6. 原实现的主要限制
+
+- 离线和在线都写死为 `OpenAIEmbeddings`，无法直接使用本地 `bge-m3`。
+- `format_contexts()` 只拼接 `page_content`，丢弃来源文件和页码等 metadata，不利于可靠引用。
+- Retriever 只设置 `top k`，没有最低相似度阈值、分数判断或 Reranker，最相似的结果不一定真正相关。
+- 建库参数 `delete_chroma_db=True`，重新建库默认先删除旧数据库，失败时缺少可用旧版本和回滚切换机制。
+- 离线代码逐个 Chunk 调用 `add_documents()`，批次较小，效率有限。
+- 在线每次工具调用都会重新创建 Embedding、Chroma 和 Retriever 对象，存在重复初始化开销。
+
 ## 当前完整架构
 
 ```text
@@ -252,6 +350,8 @@ LangGraph：State、节点、条件边和工具循环
 LLM：get_model() → ChatOllama(qwen3:4b)
 ↕
 Tools：ToolNode 执行 Calculator / WebSearch 等工具
+↕
+RAG Tool：Database_Search → Retriever → Chroma
 ↓
 LangChain 消息：AIMessage / ToolMessage / AIMessageChunk
 ↓
@@ -296,16 +396,21 @@ ChatMessage JSON 或 SSE
 - 改得动：能判断不同需求应修改 Service、Agent Graph、模型选择还是 Tool 定义；本阶段按计划未修改核心业务代码。
 - 会排错：能区分 FastAPI 健康状态、SSE 连接状态和 Ollama 模型执行状态，并能识别 CMD / PowerShell 语法环境差异。
 
+## Phase 3 四关验收
+
+- 看得懂：能定位 Document、Chunk、Embedding、Chroma、Retriever 和 Agent 调用检索工具的位置。
+- 讲得清：能分别说明离线建库与在线检索两条调用链，以及 Qwen3、Embedding 和 Chroma 的职责边界。
+- 改得动：能判断本地 Embedding、来源 metadata、阈值检索和初始化方式分别应修改哪里；本阶段按计划未改 RAG。
+- 会排错：能根据源文档、Embedding 配置和 `chroma_db` 三项状态判断原版 RAG 为什么不能运行，并识别原实现的主要风险。
+
 ## 下一阶段需要理解的内容
 
-Phase 3 只研究原项目 RAG，暂时不重写：
+Phase 4 逐步改造 Vector Store，不一次修改过多功能：
 
-- Document 从哪里进入。
-- Chunk 在哪里完成。
-- Embedding 在哪里调用。
-- Vector Store 是什么。
-- Retriever 在哪里。
-- Agent 如何调用 Retriever。
+- 明确 Chroma 与 Qdrant 的职责边界和替换范围。
+- 先设计本地 `bge-m3` 的 Embedding 接入方式。
+- 明确旧库回滚、collection 和 metadata 方案。
+- 完成最小改造后再测试建库与检索，不同时扩展其他模块。
 
 ## 面试问题
 
@@ -324,4 +429,12 @@ Phase 3 只研究原项目 RAG，暂时不重写：
 4. `research-assistant` 如何通过条件边完成 `model → tools → model` 循环并最终进入 `END`？
 5. `agent.astream()`、`message_generator()` 和 `StreamingResponse` 在 SSE 流程中分别负责什么？
 
-Phase 1 和 Phase 2 均已逐项学习并验收通过。
+### Phase 3
+
+1. 原项目为什么要把离线建库和在线检索拆成两条流程？
+2. Chat Model、Embedding Model、Vector Store 和 Retriever 分别承担什么职责？
+3. 从 PDF 进入 `./data` 到 Chunk 写入 Chroma，完整调用链是什么？
+4. `rag-assistant` 如何通过 `Database_Search`、ToolNode 和 Retriever 得到知识库内容并生成答案？
+5. 原版 RAG 在 Embedding、metadata、相关性过滤和数据库更新方面有哪些限制？
+
+Phase 1、Phase 2 和 Phase 3 均已逐项学习并验收通过。
