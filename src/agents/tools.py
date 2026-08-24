@@ -2,9 +2,14 @@ import math
 import re
 
 import numexpr
-from langchain_chroma import Chroma
 from langchain_core.tools import BaseTool, tool
-from langchain_openai import OpenAIEmbeddings
+from langchain_ollama import OllamaEmbeddings
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+
+QDRANT_PATH = "./qdrant_data"
+COLLECTION_NAME = "employee_handbook"
+EMBEDDING_MODEL = "bge-m3"
 
 
 def calculator_func(expression: str) -> str:
@@ -47,33 +52,40 @@ def format_contexts(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
 
-def load_chroma_db():
-    # Create the embedding function for our project description database
-    try:
-        embeddings = OpenAIEmbeddings()
-    except Exception as e:
-        raise RuntimeError(
-            "Failed to initialize OpenAIEmbeddings. Ensure the OpenAI API key is set."
-        ) from e
+def load_qdrant_db():
+    """Open the local Qdrant collection and create its retriever."""
+    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+    client = QdrantClient(path=QDRANT_PATH)
 
-    # Load the stored vector database
-    chroma_db = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
-    retriever = chroma_db.as_retriever(search_kwargs={"k": 5})
-    return retriever
+    try:
+        if not client.collection_exists(COLLECTION_NAME):
+            raise RuntimeError(
+                f"Qdrant collection '{COLLECTION_NAME}' does not exist. "
+                "Run scripts/create_qdrant_db.py first."
+            )
+
+        vector_store = QdrantVectorStore(
+            client=client,
+            collection_name=COLLECTION_NAME,
+            embedding=embeddings,
+        )
+        retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+        return client, retriever
+    except Exception:
+        client.close()
+        raise
 
 
 def database_search_func(query: str) -> str:
-    """Searches chroma_db for information in the company's handbook."""
-    # Get the chroma retriever
-    retriever = load_chroma_db()
+    """Searches Qdrant for information in the company's handbook."""
+    client, retriever = load_qdrant_db()
 
-    # Search the database for relevant documents
-    documents = retriever.invoke(query)
-
-    # Format the documents into a string
-    context_str = format_contexts(documents)
-
-    return context_str
+    try:
+        documents = retriever.invoke(query)
+        context_str = format_contexts(documents)
+        return context_str
+    finally:
+        client.close()
 
 
 database_search: BaseTool = tool(database_search_func)
