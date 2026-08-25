@@ -7,10 +7,11 @@ Phase 1：✅ 已完成（2026-08-18）
 Phase 2：✅ 已完成（2026-08-23）
 Phase 3：✅ 已完成（2026-08-24）
 Phase 4：✅ 已完成（2026-08-25）
-Phase 5～14：未开始
+Phase 5：✅ 已完成（2026-08-26）
+Phase 6～14：未开始
 ```
 
-当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读，以及从 Chroma / OpenAIEmbeddings 到本地 Qdrant / bge-m3 的最小迁移。下一阶段只深入 Embedding，不提前增加 Reranker。
+当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移，以及 Embedding 与相似度检索实验。下一阶段只增加 Reranker，不提前开发工单模块。
 
 ## 项目基线
 
@@ -441,6 +442,61 @@ client.close() 释放本地数据库资源和文件锁
 - 本地嵌入式 Qdrant 适合学习和单机开发；生产环境的并发和部署方案以后在工程化阶段处理。
 - Loader 使用的 `langchain-community` 已出现弃用警告，本阶段不扩大范围迁移 Loader。
 
+## Phase 5：Embedding 与相似度检索
+
+### 1. 文档 Embedding 与 Query Embedding
+
+- `OllamaEmbeddings(model="bge-m3")` 只是创建 Embedding 对象，本身不代表已经生成向量。
+- 离线建库时，`QdrantVectorStore.add_documents(chunks)` 在内部调用文档 Embedding，将每个 Chunk 转换成向量并长期保存到 Qdrant。
+- `embed_documents()` 接收 `list[str]`，返回 `list[list[float]]`；3 个 Chunk 会得到 3 个向量。
+- 在线查询时，`retriever.invoke(query)` 在内部调用 Query Embedding，将本次问题转换成一个向量后交给 Qdrant 检索。
+- `embed_query()` 接收一个 `str`，返回一个 `list[float]`；Query Vector 通常只用于本次查询，不作为知识文档长期保存。
+- 当前 `bge-m3` 的文档向量和查询向量都是 1024 维。
+
+### 2. 向量空间与维度
+
+- 文档和问题必须由兼容的同一个 Embedding 模型生成，才能位于同一个向量空间并进行有意义的比较。
+- 向量维度相同只是数据结构兼容，不代表语义空间相同；两个不同模型即使都输出 1024 维，也不能因此直接混用。
+- 1024 维向量是 1024 个浮点数组成的整体表示，单个维度通常没有适合人类直接解释的固定含义。
+- `qwen3:4b` 不读取这些浮点向量，也不负责计算相似度；它最终读取的是 ToolMessage 中的检索文本。
+
+### 3. Cosine Similarity 实验
+
+本阶段直接使用 `bge-m3` 生成向量并手工计算 Cosine Similarity：
+
+```text
+vector_size: 1024
+PTO vs vacation: 0.6394
+PTO vs cake: 0.2993
+```
+
+- `paid time off` 与 `vacation days` 表达不同但语义接近，因此分数较高。
+- `paid time off` 与 `chocolate cake` 语义不相关，因此分数较低。
+- 相似度分数应结合当前模型、领域、Chunk 和测试集观察，不能脱离项目规定一个通用及格线。
+
+### 4. 真实 Qdrant 排名实验
+
+使用 `similarity_search_with_score()` 查询真实员工手册的 3 个 Chunk：
+
+```text
+rank=1, score=0.5956, page=1
+rank=2, score=0.4538, page=2
+rank=3, score=0.4409, page=0
+```
+
+- 第 1 个 Chunk 包含 `Paid Time Off (PTO): 15 days per year`，因此排名最高。
+- 预览只显示 Chunk 开头，不能仅根据前 180 个字符判断整个 Chunk 是否相关；Qdrant 比较的是完整 Chunk。
+- 查询与长 Chunk 的分数低于短句实验，是因为长 Chunk 同时包含远程办公、行为规范和安全指南等信息，目标语义被其他内容稀释。
+- Top-K 只负责相对排序，不负责判断结果是否达到最低相关性。
+- 当前只有 3 个 Chunk 且查询 `k=3`，所以即使第 2、3 名不够相关，也会全部返回；原因是没有最低相似度阈值。
+
+### 5. 当前可用的优化方向
+
+- 调整 Chunk 大小和切分方式，减少一个 Chunk 混入过多主题。
+- 根据验证集调整 Top-K，而不是盲目增加返回数量。
+- 增加经过数据验证的最低相似度阈值，过滤明显不相关结果。
+- Phase 6 再增加 Reranker，对 Qdrant 候选结果进行二次精排。
+
 ## 当前完整架构
 
 ```text
@@ -530,14 +586,21 @@ ChatMessage JSON 或 SSE
 - 改得动：能够在保留 Agent Graph 的前提下，定位并替换在线 Vector Store 与 Embedding 初始化代码。
 - 会排错：能区分 Python 导入路径、Ollama 服务、Embedding 维度、Qdrant Collection 和 Agent Tool Calling 各层问题。
 
+## Phase 5 四关验收
+
+- 看得懂：能定位文档 Embedding、Query Embedding 和 Qdrant 相似度检索的实际执行位置。
+- 讲得清：能说明 `embed_documents()` / `embed_query()` 的输入输出、1024 维向量和同一向量空间的含义。
+- 改得动：能通过独立实验替换测试文本、调整 Top-K，并观察相似度分数与结果排名。
+- 会排错：能根据模型服务、向量维度、Chunk 内容、相似度分数、Top-K 和阈值判断检索问题所在层级。
+
 ## 下一阶段需要理解的内容
 
-Phase 5 深入 Embedding，不提前增加 Reranker：
+Phase 6 增加 Reranker，只完成“候选召回 → 二次精排”的最小闭环：
 
-- 明确文档 Embedding 和 Query Embedding 分别在什么时候执行。
-- 理解 `bge-m3` 的 1024 维向量、同一向量空间和 Cosine Similarity。
-- 观察 Qdrant Collection 配置和相似度分数，建立可排错的直觉。
-- 只做一个小型可验证实验，不在本阶段加入 Reranker。
+- 先明确 Qdrant Top-K 负责召回、Reranker Top-N 负责精排的职责边界。
+- 根据当前 Windows + Ollama 环境选择一个可运行的本地 Reranker。
+- 先独立测试 Reranker，再接入 `Database_Search`，不同时修改 Agent Graph。
+- 对比接入前后的排序、上下文长度和最终答案。
 
 ## 面试问题
 
@@ -572,4 +635,12 @@ Phase 5 深入 Embedding，不提前增加 Reranker：
 4. 为什么在线检索需要同时管理 Qdrant Client 和 Retriever 的生命周期？
 5. `k=5` 是否代表一定返回 5 个相关答案？当前实现还缺少哪些相关性控制？
 
-Phase 1、Phase 2、Phase 3 和 Phase 4 均已逐项学习并验收通过。
+### Phase 5
+
+1. 文档 Embedding 与 Query Embedding 分别在什么时候执行，哪一种向量会长期保存到 Qdrant？
+2. 为什么两个 Embedding 模型即使都输出 1024 维，也不代表它们能够混用？
+3. Cosine Similarity 在当前检索链路中由谁计算，`qwen3:4b` 最终能看到什么？
+4. 为什么查询与长 Chunk 的分数可能低于语义接近的两个短句？
+5. Top-K 与最低相似度阈值分别解决什么问题？
+
+Phase 1、Phase 2、Phase 3、Phase 4 和 Phase 5 均已逐项学习并验收通过。
