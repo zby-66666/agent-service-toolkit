@@ -8,10 +8,11 @@ Phase 2：✅ 已完成（2026-08-23）
 Phase 3：✅ 已完成（2026-08-24）
 Phase 4：✅ 已完成（2026-08-25）
 Phase 5：✅ 已完成（2026-08-26）
-Phase 6～14：未开始
+Phase 6：✅ 已完成（2026-08-27）
+Phase 7～14：未开始
 ```
 
-当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移，以及 Embedding 与相似度检索实验。下一阶段只增加 Reranker，不提前开发工单模块。
+当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验，以及本地 Cross-Encoder Reranker。下一阶段只设计简单企业工单数据，不提前开发 Ticket Tools。
 
 ## 项目基线
 
@@ -21,6 +22,8 @@ Phase 6～14：未开始
 - Phase 4 Qdrant 依赖提交：`2f43bb1`
 - Phase 4 建库脚本提交：`c30f1b3`
 - Phase 4 在线检索提交：`6062a2d`
+- Phase 6 Reranker 依赖提交：`ff39e88`
+- Phase 6 Reranker 接入提交：`11f4905`
 - 本地目录：`D:\ai-learning\projects\agent-service-toolkit`
 
 ## 当前运行环境
@@ -497,6 +500,105 @@ rank=3, score=0.4409, page=0
 - 增加经过数据验证的最低相似度阈值，过滤明显不相关结果。
 - Phase 6 再增加 Reranker，对 Qdrant 候选结果进行二次精排。
 
+## Phase 6：本地 Cross-Encoder Reranker
+
+### 1. 为什么需要两级检索
+
+- Embedding 分别将 Query 和 Document 转换成向量；Qdrant 使用向量相似度快速从大量 Chunk 中召回候选。
+- Cross-Encoder 同时读取 `(Query, Document)` 文本对，直接输出相关性分数，排序通常更精确，但每个候选都需要单独计算，成本更高。
+- 因此不能用 Reranker 逐个检查整个知识库，而应由 Qdrant 先缩小候选范围，再对少量候选进行精排。
+
+职责边界：
+
+```text
+Embedding → 输出向量
+Qdrant → 输出候选 Document / Chunk
+Reranker → 输出每个候选的相关性分数和新排序
+Qwen → 输出最终自然语言答案
+```
+
+### 2. 模型与运行方案
+
+- 使用 `fastembed~=0.8.0` 和 `BAAI/bge-reranker-base`。
+- FastEmbed 使用 ONNX Runtime，不需要为本阶段引入完整 PyTorch / Transformers 技术栈。
+- 模型支持当前需要的中文、英文和最小跨语言场景，使用 CPU 推理，避免 4GB 显存上的 CUDA 兼容与资源风险。
+- 模型约 1.13GB，缓存到用户目录 `AppData/Local/fastembed_cache`，不会提交到 Git。
+- 没有选择许可证不适合商业项目的候选模型，也没有为了更强模型提前增加过重部署复杂度。
+
+### 3. 独立模型验证
+
+英文测试中，正确 PTO 文档得到明显更高的分数：
+
+```text
+PTO: 4.0273
+两个无关文档: 约 -10.19
+```
+
+使用纯 ASCII Unicode 转义排除 PowerShell 中文编码影响后，跨语言测试结果为：
+
+```text
+中文正确 PTO: 6.7419
+英文正确 PTO: 2.0063
+中文无关保险: -10.1870
+中文无关蛋糕: -10.1950
+```
+
+- Reranker 返回的是原始相关性分数，不要求位于 `0～1`，当前按“分数越高越相关”进行排序。
+- 不应过度解释两个无关候选之间极小的分数差异，重点是正确候选是否稳定排在前面。
+
+### 4. 接入后的调用链
+
+```text
+第一次 Qwen 生成 Database_Search 工具请求
+↓
+Qdrant 使用 bge-m3 召回 Top-K
+↓
+最多 5 个 Document
+↓
+关闭 QdrantClient
+↓
+BGE Cross-Encoder 评估全部候选
+↓
+按 Reranker 分数降序排列
+↓
+截取 Top-2 Document
+↓
+format_contexts()
+↓
+ToolNode 包装成 ToolMessage
+↓
+第二次 Qwen 生成最终答案
+```
+
+- `RETRIEVAL_K=5` 控制 Qdrant 候选数量，也是 Reranker 最多需要评分的数量。
+- `RERANK_TOP_N=2` 控制精排后交给 Qwen 的 Chunk 数量。
+- 如果 Qdrant 返回 5 个候选，Reranker 必须先评估全部 5 个，再截取最高的 2 个；不能只评估前 2 个。
+- Qdrant 查询结束后 Document 已进入内存，Reranker 不需要数据库连接，因此先关闭 Client，减少本地文件锁占用时间。
+
+### 5. 模型缓存
+
+- 磁盘缓存保存下载的 ONNX 模型文件，解决“服务或电脑重启后不要重新下载”。
+- `@lru_cache(maxsize=1)` 保存当前 Python 进程中已初始化的 `TextCrossEncoder`，解决“每个请求不要重新初始化模型”。
+- 服务进程重启后 `lru_cache` 会消失，但磁盘缓存仍存在；新进程从磁盘重新初始化，不需要重新下载。
+- 连续两次调用验证结果为 `hits=1, misses=1`，说明第一次初始化、第二次复用。
+
+### 6. 验证与测试
+
+- 真实检索连续两次均保留 `15 days per year`。
+- 上下文长度从 3898 降到 3096，减少 802 个字符，约 20.6%。
+- `/rag-assistant/stream` 完整返回 Database_Search 工具调用、精排后的 ToolMessage、正确最终答案和 `[DONE]`。
+- 新增 3 个不加载真实模型的单元测试：排序与 Top-N、空候选不加载模型、文档和分数数量不匹配时报错。
+- `monkeypatch` 只在测试期间将 `get_reranker()` 替换为可控制分数的 FakeReranker，测试结束后自动恢复。
+- Ruff 检查通过；Reranker 测试 3 项通过；与模型测试组合共 12 项通过。
+
+### 7. 当前限制
+
+- Reranker 只能重排 Qdrant 已召回的候选；如果正确 Chunk 没进入 Top-K，它无法补回。
+- 固定 Top-2 仍可能保留一个分数很低的候选，因为尚未增加 Reranker 最低分数阈值。
+- Chunk 过长、Query 表达不清或模型领域能力不足仍可能影响排序。
+- FastEmbed 使用 CPU，第一条请求需要初始化 ONNX 模型，延迟高于后续请求。
+- 当前 `format_contexts()` 仍未把来源 metadata 和 Reranker 分数交给 Qwen。
+
 ## 当前完整架构
 
 ```text
@@ -514,7 +616,7 @@ LLM：get_model() → ChatOllama(qwen3:4b)
 ↕
 Tools：ToolNode 执行 Calculator / WebSearch 等工具
 ↕
-RAG Tool：Database_Search → bge-m3 → Retriever → Qdrant（employee_handbook）
+RAG Tool：Database_Search → bge-m3 → Qdrant Top-K → BGE Reranker Top-N
 ↓
 LangChain 消息：AIMessage / ToolMessage / AIMessageChunk
 ↓
@@ -565,6 +667,14 @@ ChatMessage JSON 或 SSE
 - 判断：错误发生在测试向量生成阶段，尚未进入 `retriever.invoke(query)`，因此不是 Qdrant 检索结果错误。
 - 处理：启动 Ollama 后重新测试，连续两次检索均成功。
 
+### 7. 中文 Reranker 测试出现相反排序
+
+- 现象：中文候选在终端显示为 `????`，两个无关中文文档得分很高，正确英文 PTO 文档得分很低。
+- 初步风险：可能误判为 Reranker 不支持跨语言排序。
+- 定位方法：将所有中文测试文本改成纯 ASCII 的 `\uXXXX` 转义，并打印 `unicode_escape`，验证 Python 实际收到的字符。
+- 结果：正确中文 PTO 排第一、正确英文 PTO 排第二、两个无关中文文档得分很低，证明模型满足最小跨语言需求。
+- 结论：第一次异常来自 PowerShell 管道中文编码，不是模型能力；评价模型前必须先验证实际输入。
+
 ## Phase 2 四关验收
 
 - 看得懂：能定位 API 入口、Agent 注册、Graph 定义、State、Tool、模型初始化和 Streaming 返回位置。
@@ -593,14 +703,21 @@ ChatMessage JSON 或 SSE
 - 改得动：能通过独立实验替换测试文本、调整 Top-K，并观察相似度分数与结果排名。
 - 会排错：能根据模型服务、向量维度、Chunk 内容、相似度分数、Top-K 和阈值判断检索问题所在层级。
 
+## Phase 6 四关验收
+
+- 看得懂：能定位 Qdrant 召回、Reranker 加载、候选评分、降序排序、Top-N 截取和上下文格式化的位置。
+- 讲得清：能区分 Embedding、Qdrant、Reranker 和 Qwen 的输入输出，并说明为什么采用两级检索。
+- 改得动：能够调整候选 K、最终 N、缓存配置，并用 FakeReranker 编写不依赖真实模型的排序测试。
+- 会排错：能区分候选召回不足、Reranker 排序、固定 Top-N、Chunk 质量、模型缓存和 PowerShell 中文编码问题。
+
 ## 下一阶段需要理解的内容
 
-Phase 6 增加 Reranker，只完成“候选召回 → 二次精排”的最小闭环：
+Phase 7 增加企业工单数据，只设计最小业务数据库：
 
-- 先明确 Qdrant Top-K 负责召回、Reranker Top-N 负责精排的职责边界。
-- 根据当前 Windows + Ollama 环境选择一个可运行的本地 Reranker。
-- 先独立测试 Reranker，再接入 `Database_Search`，不同时修改 Agent Graph。
-- 对比接入前后的排序、上下文长度和最终答案。
+- 根据未来工具调用需要确定 `customer`、`device`、`ticket`、`repair_record` 的最少字段和关系。
+- 先确认项目现有数据库与迁移方式，再决定复用还是新增表，不直接手写一套独立数据库框架。
+- 准备少量可验证的模拟数据，不追求复杂工单系统功能。
+- 本阶段只完成数据层和查询验证，不提前增加 Ticket Tools 或 Agent 路由。
 
 ## 面试问题
 
@@ -643,4 +760,12 @@ Phase 6 增加 Reranker，只完成“候选召回 → 二次精排”的最小�
 4. 为什么查询与长 Chunk 的分数可能低于语义接近的两个短句？
 5. Top-K 与最低相似度阈值分别解决什么问题？
 
-Phase 1、Phase 2、Phase 3、Phase 4 和 Phase 5 均已逐项学习并验收通过。
+### Phase 6
+
+1. Embedding、Qdrant、Cross-Encoder Reranker 和 Qwen 的输入输出分别是什么？
+2. 为什么采用“Qdrant Top-K 召回 → Reranker Top-N 精排”，而不是让 Reranker 扫描整个知识库？
+3. `RETRIEVAL_K=5` 和 `RERANK_TOP_N=2` 分别控制哪个阶段？
+4. 模型磁盘缓存与 `lru_cache` 的生命周期和作用有什么区别？
+5. 为什么经过 Reranker 后仍可能包含不相关 Chunk，应该从哪些层面排查和优化？
+
+Phase 1、Phase 2、Phase 3、Phase 4、Phase 5 和 Phase 6 均已逐项学习并验收通过。
