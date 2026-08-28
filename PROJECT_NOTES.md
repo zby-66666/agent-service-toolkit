@@ -9,10 +9,11 @@ Phase 3：✅ 已完成（2026-08-24）
 Phase 4：✅ 已完成（2026-08-25）
 Phase 5：✅ 已完成（2026-08-26）
 Phase 6：✅ 已完成（2026-08-27）
-Phase 7～14：未开始
+Phase 7：✅ 已完成（2026-08-28）
+Phase 8～14：未开始
 ```
 
-当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验，以及本地 Cross-Encoder Reranker。下一阶段只设计简单企业工单数据，不提前开发 Ticket Tools。
+当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验、本地 Cross-Encoder Reranker，以及独立企业工单数据层。下一阶段只把结构化业务查询封装为 Ticket Tools，不提前修改 Agent 路由或 FastAPI 接口。
 
 ## 项目基线
 
@@ -34,6 +35,7 @@ Phase 7～14：未开始
 - Ollama 0.32.9
 - 聊天模型：`qwen3:4b`
 - 状态存储：SQLite（`checkpoints.db`，已被 Git 忽略）
+- 业务数据：SQLite（`data/business.db`，已被 Git 忽略）
 - FastAPI：http://localhost:8080
 - Streamlit：http://localhost:8501
 
@@ -599,6 +601,97 @@ ToolNode 包装成 ToolMessage
 - FastEmbed 使用 CPU，第一条请求需要初始化 ONNX 模型，延迟高于后续请求。
 - 当前 `format_contexts()` 仍未把来源 metadata 和 Reranker 分数交给 Qwen。
 
+## Phase 7：企业工单数据层
+
+### 1. 状态数据与业务数据分离
+
+- `checkpoints.db` 保存 LangGraph Checkpoint，是对话和 Graph 运行状态。
+- `data/business.db` 保存客户、设备、工单和维修记录，是企业业务数据。
+- 两类数据的结构、生命周期和查询方式不同，因此不混入同一个数据库文件。
+- `*.db` 已在 `.gitignore` 中忽略；Git 只记录建库、种子和查询脚本，不记录本地数据库文件。
+
+### 2. 最小表关系
+
+```text
+customer
+  1
+  ↓
+  N
+device
+  1
+  ↓
+  N
+ticket
+  1
+  ↓
+  N
+repair_record
+```
+
+- `device.customer_id → customer.id`
+- `ticket.device_id → device.id`
+- `repair_record.ticket_id → ticket.id`
+- `ticket` 不重复保存 `customer_id`，因为可以通过 `ticket → device → customer` 得到客户，避免两份客户关系互相矛盾。
+
+### 3. 约束与索引
+
+- `PRIMARY KEY` 唯一标识每条记录。
+- `NOT NULL` 阻止必要字段为空。
+- `UNIQUE` 防止邮箱和设备序列号重复。
+- `CHECK` 将工单状态和优先级限制在允许的取值范围。
+- `FOREIGN KEY` 保证父子记录关系有效；每次 SQLite 连接都执行 `PRAGMA foreign_keys = ON`。
+- 在 `device.customer_id`、`ticket.device_id`、`repair_record.ticket_id` 上创建索引，加快关联查询。
+- `ON DELETE RESTRICT` 防止仍有子记录时直接删除父记录。
+
+### 4. 建库与种子数据
+
+```text
+scripts/create_business_db.py
+↓
+拒绝覆盖已存在的 business.db
+↓
+创建四张表、约束和索引
+```
+
+```text
+scripts/seed_business_db.py
+↓
+确认数据库和四张表存在
+↓
+确认表为空，防止重复写入
+↓
+BEGIN
+↓
+customer → device → ticket → repair_record
+↓
+全部成功 commit()；任一步失败 rollback()
+```
+
+种子数据包含 2 个客户、3 台设备、4 张工单和 2 条维修记录，能够验证已解决、处理中、未维修和跨工单累计维修次数等场景。
+
+### 5. 结构化查询
+
+- `get_customer_tickets(customer_id)` 通过 `customer → device → ticket` 查询客户全部工单。
+- 工单与维修记录使用 `LEFT JOIN`，因此没有维修记录的工单仍会保留，`COUNT(repair_record.id)` 返回 `0`。
+- `get_device_repair_count(serial_number)` 通过 `device → ticket → repair_record` 累计一台设备跨多张工单的维修记录。
+- SQL 使用 `?` 参数占位符，不把用户值直接拼接进 SQL。
+- 查询完成后在 `finally` 中关闭 SQLite 连接。
+
+### 6. 自动化测试
+
+- `tests/business/test_business_db.py` 使用 `tmp_path` 为测试创建临时数据库。
+- `monkeypatch` 只在测试期间把三个脚本的 `DATABASE_PATH` 替换为临时路径，避免修改真实业务数据。
+- 6 项测试覆盖表和数据数量、未维修工单保留、设备维修次数、不存在设备、外键约束以及防重复种子数据。
+- `pyproject.toml` 的 pytest `pythonpath` 增加项目根目录，`scripts/__init__.py` 将本地脚本声明为可导入包。
+- Phase 7 测试 6 项通过；与 LLM 和 RAG Tool 测试组合共 18 项通过。
+
+### 7. 当前限制
+
+- 当前使用同步 `sqlite3` 和本地 SQLite，只适合学习、开发和小规模单机验证。
+- 当前没有数据库迁移工具；表结构变化仍需后续设计迁移方案。
+- 数据为固定模拟数据，不包含生产级权限、审计、分页和并发写入能力。
+- 结构化查询尚未封装成 LangChain Tool，也尚未接入 Agent Graph 或 FastAPI。
+
 ## 当前完整架构
 
 ```text
@@ -623,6 +716,9 @@ LangChain 消息：AIMessage / ToolMessage / AIMessageChunk
 ChatMessage JSON 或 SSE
 ↓
 客户端展示
+
+独立业务数据层（尚未接入 Agent）：
+管理脚本 → SQLite business.db → customer / device / ticket / repair_record
 ```
 
 ## Debug 记录与已解决问题
@@ -710,14 +806,21 @@ ChatMessage JSON 或 SSE
 - 改得动：能够调整候选 K、最终 N、缓存配置，并用 FakeReranker 编写不依赖真实模型的排序测试。
 - 会排错：能区分候选召回不足、Reranker 排序、固定 Top-N、Chunk 质量、模型缓存和 PowerShell 中文编码问题。
 
+## Phase 7 四关验收
+
+- 看得懂：能区分 LangGraph 状态库与业务库，并能说明四张业务表、主键、外键、约束和索引。
+- 讲得清：能说明建库、按外键顺序插入、事务提交与回滚，以及两条结构化查询调用链。
+- 改得动：能够增加查询函数、使用参数化 SQL，并通过 `JOIN`、`LEFT JOIN`、`GROUP BY` 和 `COUNT` 得到业务结果。
+- 会排错：能区分导入路径、外键约束、重复种子数据、导入副作用和真实数据库被测试污染等问题。
+
 ## 下一阶段需要理解的内容
 
-Phase 7 增加企业工单数据，只设计最小业务数据库：
+Phase 8 把已经验证的结构化查询封装为 Ticket Tools：
 
-- 根据未来工具调用需要确定 `customer`、`device`、`ticket`、`repair_record` 的最少字段和关系。
-- 先确认项目现有数据库与迁移方式，再决定复用还是新增表，不直接手写一套独立数据库框架。
-- 准备少量可验证的模拟数据，不追求复杂工单系统功能。
-- 本阶段只完成数据层和查询验证，不提前增加 Ticket Tools 或 Agent 路由。
+- 区分普通 Python 查询函数与 LangChain Tool 的职责。
+- 为客户工单查询、设备维修历史等能力设计最小工具输入和输出。
+- 继续使用参数化 SQL、明确错误处理，并编写不依赖真实模型的 Tool 测试。
+- 本阶段只完成 Ticket Tools，不提前增加新的 Agent Graph、路由或前端功能。
 
 ## 面试问题
 
@@ -768,4 +871,12 @@ Phase 7 增加企业工单数据，只设计最小业务数据库：
 4. 模型磁盘缓存与 `lru_cache` 的生命周期和作用有什么区别？
 5. 为什么经过 Reranker 后仍可能包含不相关 Chunk，应该从哪些层面排查和优化？
 
-Phase 1、Phase 2、Phase 3、Phase 4、Phase 5 和 Phase 6 均已逐项学习并验收通过。
+### Phase 7
+
+1. 为什么 LangGraph Checkpoint 与客户、设备、工单等业务数据应该使用不同的数据库？
+2. `customer → device → ticket → repair_record` 的主外键关系是什么，为什么 `ticket` 不重复保存 `customer_id`？
+3. SQLite 为什么需要在每个连接中启用外键检查，插入数据为什么必须遵守父表到子表的顺序？
+4. `JOIN` 与 `LEFT JOIN` 有什么区别，为什么统计全部工单维修次数时需要 `LEFT JOIN`？
+5. 事务的 `commit()` 和 `rollback()` 分别有什么作用，pytest 如何避免修改真实的 `business.db`？
+
+Phase 1、Phase 2、Phase 3、Phase 4、Phase 5、Phase 6 和 Phase 7 均已逐项学习并验收通过。
