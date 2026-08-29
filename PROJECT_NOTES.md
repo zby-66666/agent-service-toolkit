@@ -11,10 +11,11 @@ Phase 5：✅ 已完成（2026-08-26）
 Phase 6：✅ 已完成（2026-08-27）
 Phase 7：✅ 已完成（2026-08-28）
 Phase 8：✅ 已完成（2026-08-30）
-Phase 9～14：未开始
+Phase 9：✅ 已完成（2026-08-30）
+Phase 10～14：未开始
 ```
 
-当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验、本地 Cross-Encoder Reranker、独立企业工单数据层，以及两个可独立验证的 Ticket Tools。下一阶段只把 Ticket Tools 接入独立 Agent Graph，不提前修改 Service、FastAPI 或前端。
+当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验、本地 Cross-Encoder Reranker、独立企业工单数据层、Ticket Tools，以及可独立执行的 Ticket Agent Graph。下一阶段只把 Ticket Agent 注册到现有 Service 并验证 API，不提前修改前端。
 
 ## 项目基线
 
@@ -792,6 +793,106 @@ ToolNode 包装成匹配调用 ID 的 ToolMessage
 - 工具输出尚未经过真实小模型的 Tool Calling 兼容性和自然语言回答验证。
 - 数据库仍是本地同步 SQLite，路径和业务错误还没有统一配置与异常类型。
 
+## Phase 9：独立 Ticket Agent Graph
+
+### 1. State 与 Graph 结构
+
+`AgentState` 继承 `MessagesState`，并增加：
+
+- `safety`：保存 Safeguard 结果。
+- `remaining_steps`：LangGraph 管理的剩余执行步数。
+
+Graph 节点与路由：
+
+```text
+guard_input
+├─ unsafe → block_unsafe_content → END
+└─ safe → model
+              ↓
+      pending_tool_calls()
+       ├─ done → END
+       └─ tools → ToolNode
+                      ↓
+                    model
+```
+
+- `builder = StateGraph(AgentState)` 是可继续增加节点和边的设计阶段对象。
+- `ticket_assistant = builder.compile()` 是可以执行 `ainvoke()` 与 `astream()` 的 `CompiledStateGraph`。
+- `MessagesState` 使用 `add_messages` 合并消息，节点返回 `{"messages": [response]}` 时会追加而不是覆盖历史。
+
+### 2. 模型与工具绑定
+
+- `model.bind_tools(tools)` 把两个 Ticket Tools 的名称、说明和参数 Schema 告诉 Qwen。
+- `ToolNode(tools)` 保存并执行真正的 BaseTool。
+- 两处必须使用同一组工具；否则模型可能请求 ToolNode 不具备的工具，或 ToolNode 有工具但模型从未看到。
+- `RunnableLambda` 在每次模型调用前将 SystemMessage 与 State 中的消息组合，不把系统提示永久写入 Graph State。
+
+### 3. 工具循环与消息对应
+
+```text
+HumanMessage
+↓
+AIMessage(tool_calls=[name, args, id])
+↓
+ToolMessage(tool_call_id=同一个 id, content=工具 JSON)
+↓
+AIMessage(content=最终回答, tool_calls=[])
+↓
+END
+```
+
+- `pending_tool_calls()` 检查最后一条消息必须是 AIMessage。
+- `tool_calls` 有值时进入 tools，无值时进入 END。
+- 工具请求 ID 与 `ToolMessage.tool_call_id` 必须一致，使模型能把每个结果对应到具体请求，尤其是一次请求多个工具时。
+- tools 节点执行后固定回到 model，让模型根据原问题和 ToolMessage 生成用户可读答案。
+- 当 `remaining_steps < 2` 且模型仍请求工具时，Graph 返回不带工具调用的普通 AIMessage，防止工具循环耗尽递归步数。
+
+### 4. Fake Model Graph 测试
+
+`tests/agents/test_ticket_assistant.py` 使用固定消息响应验证三条路由：
+
+1. 模型返回普通 AIMessage：`model → END`。
+2. 模型先返回 `Customer_Tickets` 工具调用，再返回最终回答：`model → tools → ToolMessage → model → END`。
+3. Safeguard 返回 UNSAFE：`guard_input → block_unsafe_content → END`，模型不会执行。
+
+- Fake Model 支持 `bind_tools()`，但不会自行推理；测试预先规定 `AIMessage.tool_calls`。
+- Graph 测试临时替换 Tool 的执行函数，只验证节点、边、消息顺序和调用 ID；真实 SQL 已在 Phase 8 单独验证。
+- Fake 测试稳定、快速，不依赖 Ollama，适合作为自动化回归测试。
+
+### 5. 真实 Qwen 端到端验证
+
+`qwen3:4b` 已分别成功完成两个真实工具循环：
+
+```text
+客户 1 工单问题
+→ Customer_Tickets(customer_id=1)
+→ ToolMessage 返回 3 张工单
+→ 最终回答正确列出 1001 / 1002 / 1003 及状态
+```
+
+```text
+SN-ACME-1001 维修历史问题
+→ Device_Repair_History(serial_number="SN-ACME-1001")
+→ ToolMessage 返回 2 条维修记录
+→ 最终回答正确总结两次诊断和维修操作
+```
+
+两次真实测试均验证：
+
+- Qwen 自主选择正确工具并生成正确参数。
+- AIMessage 的工具调用 ID 与 ToolMessage 的 `tool_call_id` 一致。
+- ToolNode 执行真实 BaseTool，读取真实 `business.db`。
+- 第二次模型调用能根据 JSON 工具结果生成正确自然语言答案。
+- 最终 AIMessage 的 `tool_calls` 为空，Graph 正常进入 END。
+
+### 6. 测试与当前限制
+
+- Ticket Agent Graph 测试 3 项通过；与 LLM、RAG、业务库和 Ticket Tool 测试组合共 27 项通过。
+- 现有 4 个 warning 来自项目原有 LangGraph / `langchain-community` 弃用提示，不是本阶段回归。
+- 当前没有 `GROQ_API_KEY` 时 Safeguard 会跳过真实安全模型并直接返回 SAFE；这不代表输入完成了真实安全检查。
+- Ticket Agent 尚未加入 `src/agents/agents.py` 注册表，因此可以直接 `ticket_assistant.ainvoke()`，但 Service 尚不能根据 `ticket-assistant` 找到它。
+- 当前尚未通过非流式或 SSE FastAPI 路径验证，也未接入 Streamlit。
+
 ## 当前完整架构
 
 ```text
@@ -820,7 +921,9 @@ ChatMessage JSON 或 SSE
 独立业务数据层（尚未接入 Agent）：
 管理脚本 → SQLite business.db → customer / device / ticket / repair_record
 ↓
-business.queries → Customer_Tickets / Device_Repair_History（可独立 invoke，尚未绑定模型）
+business.queries → Customer_Tickets / Device_Repair_History（可独立 invoke，也已绑定独立 Agent）
+↓
+独立 Ticket Agent：guard_input → model ↔ ToolNode → END（尚未注册到 Service）
 ```
 
 ## Debug 记录与已解决问题
@@ -922,14 +1025,21 @@ business.queries → Customer_Tickets / Device_Repair_History（可独立 invoke
 - 改得动：能够增加带类型注解和 docstring 的 Ticket Tool，并将业务数据组织为稳定 JSON 输出。
 - 会排错：能判断问题发生在参数 Schema、工具函数、SQL、数据库路径、JSON 序列化还是尚未接入 Agent 的边界。
 
+## Phase 9 四关验收
+
+- 看得懂：能区分 StateGraph builder、CompiledStateGraph、节点、普通边、条件边、MessagesState 和 RemainingSteps。
+- 讲得清：能完整说明 `guard_input → model → tools → ToolMessage → model → END` 及工具调用 ID 的作用。
+- 改得动：能够绑定新的 BaseTool、配置 ToolNode、增加路由测试，并用 Fake Model 控制不同 Graph 分支。
+- 会排错：能区分模型未生成 tool_calls、工具名称不一致、ToolNode 执行失败、调用 ID 不匹配、无限循环、Ollama 状态和 Safeguard 被跳过等问题。
+
 ## 下一阶段需要理解的内容
 
-Phase 9 把已经验证的 Ticket Tools 接入独立 Ticket Agent Graph：
+Phase 10 把已经验证的 Ticket Agent 接入现有 Service 与 FastAPI：
 
-- 让模型通过 `bind_tools()` 看到两个 Ticket Tools。
-- 使用 StateGraph、ToolNode 和条件边完成 `model → tools → model` 循环。
-- 验证 `AIMessage.tool_calls`、工具调用 ID、ToolMessage 和最终 AIMessage。
-- 本阶段只完成并测试独立 Ticket Agent，不提前接入 Service、FastAPI 或 Streamlit。
+- 在 `src/agents/agents.py` 注册 `ticket-assistant`，让 `get_agent(agent_id)` 可以选择它。
+- 通过 `/info` 验证 Agent 元数据，并分别验证 `/ticket-assistant/invoke` 与 `/ticket-assistant/stream`。
+- 检查 Service 对 HumanMessage、RunnableConfig、Graph 消息和 SSE 事件的现有编排能否直接复用。
+- 本阶段只完成 Service / API 接入与测试，不提前修改 Streamlit 页面。
 
 ## 面试问题
 
@@ -996,4 +1106,12 @@ Phase 9 把已经验证的 Ticket Tools 接入独立 Ticket Agent Graph：
 4. 为什么 Ticket Tool 返回带字段名的 JSON，而不是无字段名的 tuple？
 5. `tmp_path` 和 `monkeypatch` 如何避免 Ticket Tool 测试修改真实业务数据库？
 
-Phase 1、Phase 2、Phase 3、Phase 4、Phase 5、Phase 6、Phase 7 和 Phase 8 均已逐项学习并验收通过。
+### Phase 9
+
+1. StateGraph builder 与 `compile()` 后的 CompiledStateGraph 分别用于什么？
+2. `model.bind_tools(tools)` 与 `ToolNode(tools)` 分别承担什么职责，为什么要使用同一组工具？
+3. `pending_tool_calls()` 如何控制 `model → tools → model` 循环，RemainingSteps 如何防止循环失控？
+4. 为什么 AIMessage 工具请求 ID 必须与 ToolMessage 的 `tool_call_id` 对应？
+5. Fake Model Graph 测试和真实 Qwen 端到端测试分别证明什么，为什么当前 Agent 仍不能通过 FastAPI 路径访问？
+
+Phase 1、Phase 2、Phase 3、Phase 4、Phase 5、Phase 6、Phase 7、Phase 8 和 Phase 9 均已逐项学习并验收通过。
