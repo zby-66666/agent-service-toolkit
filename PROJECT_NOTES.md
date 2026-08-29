@@ -10,10 +10,11 @@ Phase 4：✅ 已完成（2026-08-25）
 Phase 5：✅ 已完成（2026-08-26）
 Phase 6：✅ 已完成（2026-08-27）
 Phase 7：✅ 已完成（2026-08-28）
-Phase 8～14：未开始
+Phase 8：✅ 已完成（2026-08-30）
+Phase 9～14：未开始
 ```
 
-当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验、本地 Cross-Encoder Reranker，以及独立企业工单数据层。下一阶段只把结构化业务查询封装为 Ticket Tools，不提前修改 Agent 路由或 FastAPI 接口。
+当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验、本地 Cross-Encoder Reranker、独立企业工单数据层，以及两个可独立验证的 Ticket Tools。下一阶段只把 Ticket Tools 接入独立 Agent Graph，不提前修改 Service、FastAPI 或前端。
 
 ## 项目基线
 
@@ -692,6 +693,105 @@ customer → device → ticket → repair_record
 - 数据为固定模拟数据，不包含生产级权限、审计、分页和并发写入能力。
 - 结构化查询尚未封装成 LangChain Tool，也尚未接入 Agent Graph 或 FastAPI。
 
+## Phase 8：Ticket Tools
+
+### 1. 三层职责
+
+```text
+src/business/queries.py
+↓
+连接 SQLite、执行参数化 SQL、返回 list[dict]
+↓
+src/agents/ticket_tools.py 中的普通工具函数
+↓
+统计并组织业务结果、json.dumps() 转成 JSON 字符串
+↓
+LangChain BaseTool
+↓
+提供工具名称、说明、args_schema、参数校验和 invoke() 接口
+```
+
+- 数据访问层不依赖 LangChain，可以被 Tool、API、后台任务和测试复用。
+- 普通工具函数不直接写 SQL，只调用数据访问层并整理模型容易理解的结果。
+- `tool(function)` 只创建 Tool 对象，不会立即执行查询。
+- `BaseTool.invoke()` 可以由测试代码手工调用，也可以在未来由 ToolNode 调用。
+
+### 2. 应用数据访问层
+
+- `PROJECT_ROOT = Path(__file__).resolve().parents[2]` 从源文件位置定位项目根目录，避免数据库路径依赖当前终端目录。
+- `connect_business_db()` 检查 `business.db` 是否存在，启用外键检查，并设置 `sqlite3.Row`。
+- `get_customer_tickets(customer_id)` 查询客户、设备、工单状态、优先级和维修记录数量。
+- `get_device_repair_history(serial_number)` 查询设备所属客户、历史工单、诊断、维修操作、维修人员和维修时间。
+- `sqlite3.Row → dict(row)` 将无字段名元组转换成带字段名的字典。
+
+### 3. 两个 Ticket Tools
+
+`Customer_Tickets`：
+
+```text
+输入：customer_id: int
+输出：customer_id、ticket_count、tickets 的 JSON 字符串
+```
+
+`Device_Repair_History`：
+
+```text
+输入：serial_number: str
+输出：设备、客户、ticket_count、repair_record_count、history 的 JSON 字符串
+```
+
+- Python 类型注解和 docstring 用于生成工具的 `args_schema` 与 description。
+- JSON 具有稳定字段名，比位置依赖的 tuple 更容易被模型和程序正确理解。
+- 集合推导式去重 `ticket_id`，避免同一工单的多条维修记录导致工单数重复。
+- 布尔表达式求和统计非空的 `repair_record_id` 数量。
+- 找不到设备时返回 `found: false` 和空历史；空序列号与非正客户 ID 会返回明确错误。
+
+### 4. 手工 Tool 测试与未来 Agent 调用
+
+当前独立测试：
+
+```text
+测试代码
+↓
+BaseTool.invoke()
+↓
+参数校验 → 普通工具函数 → business.queries → SQLite
+↓
+JSON 字符串
+```
+
+未来 Agent 调用：
+
+```text
+Qwen 生成 AIMessage.tool_calls（工具名、参数、调用 ID）
+↓
+ToolNode 找到并执行 BaseTool
+↓
+Ticket Tool 查询 SQLite 并返回 JSON
+↓
+ToolNode 包装成匹配调用 ID 的 ToolMessage
+↓
+第二次 model 组织最终回答
+```
+
+手工 `.invoke()` 不代表模型选择了工具，也不会自动产生 `AIMessage.tool_calls` 或 `ToolMessage`。
+
+### 5. 自动化测试
+
+- `tests/agents/test_ticket_tools.py` 包含 6 项测试。
+- `tmp_path` 创建临时目录和临时 `business.db`，不接触真实业务数据库。
+- `monkeypatch` 在测试期间将数据访问层的 `BUSINESS_DATABASE_PATH` 替换为临时文件，测试结束后自动恢复。
+- 测试覆盖 Tool 名称和 Schema、客户工单 JSON、非法客户 ID、设备维修统计、不存在设备和空序列号。
+- 测试使用真实临时 SQLite 和真实 SQL，但不调用 Qwen，也不生成 ToolMessage。
+- Phase 8 Ticket Tool 测试 6 项通过；与 LLM、RAG Tool 和业务数据库测试组合共 24 项通过。
+
+### 6. 当前限制
+
+- Ticket Tools 尚未传给 `model.bind_tools()`，也尚未加入 ToolNode。
+- 当前没有独立 Ticket Agent Graph，Qwen 不会自动选择这两个工具。
+- 工具输出尚未经过真实小模型的 Tool Calling 兼容性和自然语言回答验证。
+- 数据库仍是本地同步 SQLite，路径和业务错误还没有统一配置与异常类型。
+
 ## 当前完整架构
 
 ```text
@@ -719,6 +819,8 @@ ChatMessage JSON 或 SSE
 
 独立业务数据层（尚未接入 Agent）：
 管理脚本 → SQLite business.db → customer / device / ticket / repair_record
+↓
+business.queries → Customer_Tickets / Device_Repair_History（可独立 invoke，尚未绑定模型）
 ```
 
 ## Debug 记录与已解决问题
@@ -813,14 +915,21 @@ ChatMessage JSON 或 SSE
 - 改得动：能够增加查询函数、使用参数化 SQL，并通过 `JOIN`、`LEFT JOIN`、`GROUP BY` 和 `COUNT` 得到业务结果。
 - 会排错：能区分导入路径、外键约束、重复种子数据、导入副作用和真实数据库被测试污染等问题。
 
+## Phase 8 四关验收
+
+- 看得懂：能区分数据访问函数、普通工具函数、BaseTool、模型工具请求、ToolNode 和 ToolMessage。
+- 讲得清：能分别说明手工 `BaseTool.invoke()` 与未来 `model → ToolNode → ToolMessage → model` 的调用链。
+- 改得动：能够增加带类型注解和 docstring 的 Ticket Tool，并将业务数据组织为稳定 JSON 输出。
+- 会排错：能判断问题发生在参数 Schema、工具函数、SQL、数据库路径、JSON 序列化还是尚未接入 Agent 的边界。
+
 ## 下一阶段需要理解的内容
 
-Phase 8 把已经验证的结构化查询封装为 Ticket Tools：
+Phase 9 把已经验证的 Ticket Tools 接入独立 Ticket Agent Graph：
 
-- 区分普通 Python 查询函数与 LangChain Tool 的职责。
-- 为客户工单查询、设备维修历史等能力设计最小工具输入和输出。
-- 继续使用参数化 SQL、明确错误处理，并编写不依赖真实模型的 Tool 测试。
-- 本阶段只完成 Ticket Tools，不提前增加新的 Agent Graph、路由或前端功能。
+- 让模型通过 `bind_tools()` 看到两个 Ticket Tools。
+- 使用 StateGraph、ToolNode 和条件边完成 `model → tools → model` 循环。
+- 验证 `AIMessage.tool_calls`、工具调用 ID、ToolMessage 和最终 AIMessage。
+- 本阶段只完成并测试独立 Ticket Agent，不提前接入 Service、FastAPI 或 Streamlit。
 
 ## 面试问题
 
@@ -879,4 +988,12 @@ Phase 8 把已经验证的结构化查询封装为 Ticket Tools：
 4. `JOIN` 与 `LEFT JOIN` 有什么区别，为什么统计全部工单维修次数时需要 `LEFT JOIN`？
 5. 事务的 `commit()` 和 `rollback()` 分别有什么作用，pytest 如何避免修改真实的 `business.db`？
 
-Phase 1、Phase 2、Phase 3、Phase 4、Phase 5、Phase 6 和 Phase 7 均已逐项学习并验收通过。
+### Phase 8
+
+1. `business/queries.py`、普通工具函数和 BaseTool 分别承担什么职责？
+2. Tool 的 name、description 和 `args_schema` 分别从哪里产生，执行前如何校验输入？
+3. 为什么手工执行 `BaseTool.invoke()` 不代表 Qwen 已经选择了工具，也不会生成 ToolMessage？
+4. 为什么 Ticket Tool 返回带字段名的 JSON，而不是无字段名的 tuple？
+5. `tmp_path` 和 `monkeypatch` 如何避免 Ticket Tool 测试修改真实业务数据库？
+
+Phase 1、Phase 2、Phase 3、Phase 4、Phase 5、Phase 6、Phase 7 和 Phase 8 均已逐项学习并验收通过。
