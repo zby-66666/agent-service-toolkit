@@ -4,8 +4,14 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from agents.agents import agents, get_agent, load_agent
+from agents.agents import (
+    agents,
+    get_agent,
+    get_all_agent_info,
+    load_agent,
+)
 from agents.lazy_agent import LazyLoadingAgent
+from agents.ticket_assistant import ticket_assistant
 
 
 class TestAgentLoading:
@@ -69,3 +75,15 @@ class TestAgentLoading:
         """Test getting a non-existent agent."""
         with pytest.raises(KeyError):
             get_agent("nonexistent-agent")
+
+    def test_ticket_assistant_registered(self):
+        """验证 Ticket Agent 已注册并带有正确描述。"""
+        agent = get_agent("ticket-assistant")
+        info_by_key = {item.key: item for item in get_all_agent_info()}
+
+        assert agent is ticket_assistant
+        assert "ticket-assistant" in info_by_key
+        assert info_by_key["ticket-assistant"].description == (
+            "An AcmeTech support ticket assistant with access to "
+            "customer tickets and device repair history."
+        )

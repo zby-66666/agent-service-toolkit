@@ -12,10 +12,11 @@ Phase 6：✅ 已完成（2026-08-27）
 Phase 7：✅ 已完成（2026-08-28）
 Phase 8：✅ 已完成（2026-08-30）
 Phase 9：✅ 已完成（2026-08-30）
-Phase 10～14：未开始
+Phase 10：✅ 已完成（2026-08-30）
+Phase 11～14：未开始
 ```
 
-当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验、本地 Cross-Encoder Reranker、独立企业工单数据层、Ticket Tools，以及可独立执行的 Ticket Agent Graph。下一阶段只把 Ticket Agent 注册到现有 Service 并验证 API，不提前修改前端。
+当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验、本地 Cross-Encoder Reranker、独立企业工单数据层、Ticket Tools、Ticket Agent Graph，以及 Ticket Agent 的 Service / FastAPI 接入。当前尚未修改 Streamlit 客户端。
 
 ## 项目基线
 
@@ -1032,14 +1033,86 @@ business.queries → Customer_Tickets / Device_Repair_History（可独立 invoke
 - 改得动：能够绑定新的 BaseTool、配置 ToolNode、增加路由测试，并用 Fake Model 控制不同 Graph 分支。
 - 会排错：能区分模型未生成 tool_calls、工具名称不一致、ToolNode 执行失败、调用 ID 不匹配、无限循环、Ollama 状态和 Safeguard 被跳过等问题。
 
+## Phase 10：Ticket Agent 的 Service / FastAPI 接入
+
+### 1. Agent 注册
+
+在 `src/agents/agents.py` 中导入编译后的 `ticket_assistant`，并以 `ticket-assistant` 为 key 加入 `agents` 注册表。
+
+注册表把外部传入的字符串 `agent_id` 映射为可执行的 `CompiledStateGraph`。因此不需要为 Ticket Agent 单独编写一套 FastAPI 路由。
+
+### 2. 动态路由复用
+
+Service 已经提供以下动态路由：
+
+```text
+/{agent_id}/invoke
+/{agent_id}/stream
+```
+
+请求 `/ticket-assistant/invoke` 或 `/ticket-assistant/stream` 时，FastAPI 从路径取得 `agent_id="ticket-assistant"`，然后通过 `get_agent(agent_id)` 从注册表选择 Ticket Agent。
+
+`/info` 调用 `get_all_agent_info()` 读取同一个注册表，因此注册完成后会自动返回 Ticket Agent 的 key 和 description。
+
+### 3. 非流式调用链
+
+```text
+POST /ticket-assistant/invoke
+↓
+FastAPI 解析 agent_id，并由 Pydantic 校验请求体
+↓
+_handle_input() 创建 HumanMessage 和 RunnableConfig
+↓
+get_agent("ticket-assistant") 取得 CompiledStateGraph
+↓
+agent.ainvoke() 执行 Ticket Agent
+↓
+model → ToolNode → model
+↓
+提取最终 AIMessage，转换为 ChatMessage 并追加 run_id
+↓
+FastAPI 序列化为 JSON
+```
+
+非流式响应只返回 Graph 完成后的最终 `AIMessage`。中间的工具请求已经执行完毕，最终消息不再请求工具，所以最终响应中的 `tool_calls` 可以为空；这不代表 Graph 没有调用工具。
+
+### 4. 流式调用链
+
+```text
+POST /ticket-assistant/stream
+↓
+get_agent("ticket-assistant")
+↓
+agent.astream() 产生 Graph 执行事件
+↓
+message_generator() 包装 token/message SSE 事件
+↓
+StreamingResponse 发送给客户端
+↓
+data: [DONE]
+```
+
+流式接口的 HTTP 200 首先表示 SSE 连接已经建立，不保证后续模型或工具一定成功。连接建立后的异常仍可能通过 `type=error` 的 SSE 事件返回。
+
+### 5. 验证结果
+
+- `/info` 能列出 `ticket-assistant` 及其描述。
+- `/ticket-assistant/invoke` 能调用 `Customer_Tickets`，返回客户 1 的 3 个工单及其状态。
+- `/ticket-assistant/stream` 能依次显示工具请求、ToolMessage、最终回答和 `[DONE]`。
+- `tests/agents/test_agent_loading.py` 新增注册测试，验证 `get_agent()` 返回正确 Graph，并验证 `/info` 使用的元数据。
+- Agent loading 测试共 8 项，全部通过。
+- 已确认测试断言位于测试方法内部，而不是在测试类定义阶段执行。
+
+## Phase 10 四关验收
+
+- 看得懂：能区分动态路由、`agent_id`、Agent 注册表、`get_agent()` 和 `CompiledStateGraph`。
+- 讲得清：能完整说明 `/invoke` 与 `/stream` 从 HTTP 请求到 Graph 再到响应的调用链。
+- 改得动：能够注册新 Agent，并补充 Agent loading 与元数据测试，不重复编写 Service 路由。
+- 会排错：能区分 Agent 未注册、路径 key 错误、模型或工具执行失败、SSE 连接成功但流内返回 error，以及测试缩进错误。
+
 ## 下一阶段需要理解的内容
 
-Phase 10 把已经验证的 Ticket Agent 接入现有 Service 与 FastAPI：
-
-- 在 `src/agents/agents.py` 注册 `ticket-assistant`，让 `get_agent(agent_id)` 可以选择它。
-- 通过 `/info` 验证 Agent 元数据，并分别验证 `/ticket-assistant/invoke` 与 `/ticket-assistant/stream`。
-- 检查 Service 对 HumanMessage、RunnableConfig、Graph 消息和 SSE 事件的现有编排能否直接复用。
-- 本阶段只完成 Service / API 接入与测试，不提前修改 Streamlit 页面。
+Phase 11 将在保持后端调用链不变的前提下，检查现有客户端如何读取 Agent 列表、选择 `ticket-assistant` 并消费 invoke 或 SSE 响应。开始前先阅读客户端代码，再决定是否需要最小修改。
 
 ## 面试问题
 
@@ -1114,4 +1187,12 @@ Phase 10 把已经验证的 Ticket Agent 接入现有 Service 与 FastAPI：
 4. 为什么 AIMessage 工具请求 ID 必须与 ToolMessage 的 `tool_call_id` 对应？
 5. Fake Model Graph 测试和真实 Qwen 端到端测试分别证明什么，为什么当前 Agent 仍不能通过 FastAPI 路径访问？
 
-Phase 1、Phase 2、Phase 3、Phase 4、Phase 5、Phase 6、Phase 7、Phase 8 和 Phase 9 均已逐项学习并验收通过。
+### Phase 10
+
+1. 为什么注册 `ticket-assistant` 后可以直接复用 `/{agent_id}/invoke` 和 `/{agent_id}/stream`，不需要新增路由？
+2. `get_agent(agent_id)` 如何把 URL 中的字符串转换为可执行的 `CompiledStateGraph`？
+3. `/invoke` 和 `/stream` 分别如何执行并返回 Agent 结果，为什么非流式最终消息的 `tool_calls` 可以为空？
+4. `/info` 为什么能自动显示新 Agent，`get_all_agent_info()` 与 `agents` 注册表是什么关系？
+5. 为什么流式接口返回 HTTP 200 仍不能证明模型和工具执行成功，客户端还必须检查哪些 SSE 事件？
+
+Phase 1 至 Phase 10 均已逐项学习并验收通过。

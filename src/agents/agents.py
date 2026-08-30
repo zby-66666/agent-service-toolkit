@@ -14,6 +14,7 @@ from agents.langgraph_supervisor_hierarchy_agent import langgraph_supervisor_hie
 from agents.lazy_agent import LazyLoadingAgent
 from agents.rag_assistant import rag_assistant
 from agents.research_assistant import research_assistant
+from agents.ticket_assistant import ticket_assistant
 from schema import AgentInfo
 
 DEFAULT_AGENT = "research-assistant"
@@ -40,6 +41,13 @@ agents: dict[str, Agent] = {
     "rag-assistant": Agent(
         description="A RAG assistant with access to information in a database.",
         graph_like=rag_assistant,
+    ),
+    "ticket-assistant": Agent(
+        description=(
+            "An AcmeTech support ticket assistant with access to "
+            "customer tickets and device repair history."
+        ),
+        graph_like=ticket_assistant,
     ),
     "command-agent": Agent(description="A command agent.", graph_like=command_agent),
     "bg-task-agent": Agent(description="A background task agent.", graph_like=bg_task_agent),
