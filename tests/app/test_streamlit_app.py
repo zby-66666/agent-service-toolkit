@@ -51,7 +51,7 @@ def test_app_settings(mock_agent_client):
     assert at.sidebar.selectbox[0].value == "gpt-5-nano"
     assert mock_agent_client.agent == "test-agent"
     at.sidebar.selectbox[0].set_value("gpt-5-mini")
-    at.sidebar.selectbox[1].set_value("chatbot")
+    at.sidebar.selectbox[1].set_value("ticket-assistant")
     at.chat_input[0].set_value(PROMPT).run()
     print(at)
 
@@ -62,7 +62,7 @@ def test_app_settings(mock_agent_client):
     assert at.chat_message[1].markdown[0].value == RESPONSE
 
     # Check the args match the settings
-    assert mock_agent_client.agent == "chatbot"
+    assert mock_agent_client.agent == "ticket-assistant"
     mock_agent_client.ainvoke.assert_called_with(
         message=PROMPT,
         model=OpenAIModelName.GPT_5_MINI,

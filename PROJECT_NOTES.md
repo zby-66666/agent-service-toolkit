@@ -13,10 +13,11 @@ Phase 7：✅ 已完成（2026-08-28）
 Phase 8：✅ 已完成（2026-08-30）
 Phase 9：✅ 已完成（2026-08-30）
 Phase 10：✅ 已完成（2026-08-30）
-Phase 11～14：未开始
+Phase 11：✅ 已完成（2026-08-31）
+Phase 12～14：未开始
 ```
 
-当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验、本地 Cross-Encoder Reranker、独立企业工单数据层、Ticket Tools、Ticket Agent Graph，以及 Ticket Agent 的 Service / FastAPI 接入。当前尚未修改 Streamlit 客户端。
+当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验、本地 Cross-Encoder Reranker、独立企业工单数据层、Ticket Tools、Ticket Agent Graph、Service / FastAPI 接入，以及 Streamlit 端到端验证。现有客户端本身已经支持动态 Agent，因此没有修改生产客户端代码。
 
 ## 项目基线
 
@@ -1110,9 +1111,89 @@ data: [DONE]
 - 改得动：能够注册新 Agent，并补充 Agent loading 与元数据测试，不重复编写 Service 路由。
 - 会排错：能区分 Agent 未注册、路径 key 错误、模型或工具执行失败、SSE 连接成功但流内返回 error，以及测试缩进错误。
 
+## Phase 11：Streamlit 客户端接入与 SSE 展示
+
+### 1. 动态 Agent 列表
+
+`AgentClient` 初始化时通过 `retrieve_info()` 请求 `/info`，并把服务端元数据保存到 `self.info`。
+
+```text
+agents 注册表
+↓
+GET /info
+↓
+AgentClient.retrieve_info()
+↓
+self.info.agents：所有候选 Agent
+↓
+Streamlit selectbox
+↓
+self.agent：当前选择的一个 Agent
+```
+
+因此 Phase 10 注册 `ticket-assistant` 后，它会自动出现在 Streamlit 下拉框，不需要在生产前端中再次写死。
+
+### 2. 客户端请求地址
+
+用户选择 `ticket-assistant` 后，`agent_client.agent` 保存当前选择。`AgentClient.astream()` 使用：
+
+```python
+f"{self.base_url}/{self.agent}/stream"
+```
+
+生成 `/ticket-assistant/stream` 请求地址。非流式调用同理生成 `/ticket-assistant/invoke`。
+
+### 3. SSE 解析
+
+`_parse_stream_line()` 把服务端 SSE 文本行转换为客户端对象：
+
+```text
+type=token   → str
+type=message → ChatMessage
+[DONE]       → None
+```
+
+`astream()` 是异步生成器，它逐行读取 SSE，并通过 `yield` 把 `str` 或 `ChatMessage` 交给 Streamlit；遇到 `None` 时结束循环。
+
+### 4. Streamlit 消息展示
+
+- `streaming_content`：累加目前收到的 token。
+- `streaming_placeholder`：反复更新页面上的同一个显示位置。
+- 最终 `AIMessage` 到达后，用完整内容覆盖 placeholder，避免重复显示。
+- `call_results` 使用工具调用 ID 保存状态框；收到 `ToolMessage` 后，通过 `tool_call_id` 更新正确的工具状态框。
+
+### 5. 自动化测试
+
+`tests/app/conftest.py` 的 `mock_info` 增加 `ticket-assistant`，模拟 `/info` 返回动态 Agent 列表。
+
+`test_app_settings()` 模拟用户在下拉框选择 `ticket-assistant`，并断言 `mock_agent_client.agent` 已更新。
+
+测试最初出现 `AppTest script run timed out`，真正原因是公共 `mock_env` 使用 `clear=True` 清除了 Windows 的 `USERPROFILE`，导致 Streamlit 线程中的 `Path.home()` 抛出：
+
+```text
+RuntimeError: Could not determine home directory.
+```
+
+修复方式是在 App 测试 fixture 中使用 `tmp_path` 创建临时目录，并用 `monkeypatch.setenv()` 临时设置 `USERPROFILE`。测试结束后环境变量自动恢复。
+
+### 6. 验证结果
+
+- Streamlit 下拉框能够显示并选择 `ticket-assistant`。
+- `Customer_Tickets` 和 `Device_Repair_History` 均能显示工具输入、输出和最终回答。
+- `tests/client/test_client.py` 与 `tests/app/test_streamlit_app.py` 共 26 项测试，全部通过。
+- Ruff 与 `git diff --check` 均通过。
+- 生产客户端无需修改，本阶段只补充回归测试和测试环境修复。
+
+## Phase 11 四关验收
+
+- 看得懂：能区分 `self.info.agents`、`self.agent`、`_parse_stream_line()`、`astream()` 和 `draw_messages()`。
+- 讲得清：能说明从 `/info` 到下拉框，以及从 SSE 到页面 token、工具状态框和最终答案的完整链路。
+- 改得动：能够给 UI mock 增加 Agent，并修改 AppTest 验证选择结果。
+- 会排错：能从外层 timeout 继续追查到底层线程异常，并用 `tmp_path` 与 `monkeypatch` 隔离测试环境。
+
 ## 下一阶段需要理解的内容
 
-Phase 11 将在保持后端调用链不变的前提下，检查现有客户端如何读取 Agent 列表、选择 `ticket-assistant` 并消费 invoke 或 SSE 响应。开始前先阅读客户端代码，再决定是否需要最小修改。
+实际学习过程中额外拆出了 Service / API 接入和 Streamlit 接入两个阶段。下一阶段先回到原路线中尚未完成的 Memory，学习 `thread_id`、`user_id`、MessagesState、Checkpoint、历史读取与多轮对话恢复；暂不提前加入 MCP。
 
 ## 面试问题
 
@@ -1195,4 +1276,12 @@ Phase 11 将在保持后端调用链不变的前提下，检查现有客户端�
 4. `/info` 为什么能自动显示新 Agent，`get_all_agent_info()` 与 `agents` 注册表是什么关系？
 5. 为什么流式接口返回 HTTP 200 仍不能证明模型和工具执行成功，客户端还必须检查哪些 SSE 事件？
 
-Phase 1 至 Phase 10 均已逐项学习并验收通过。
+### Phase 11
+
+1. `ticket-assistant` 为什么不需要写死在 Streamlit 中也能自动出现在 Agent 下拉框？
+2. `self.info.agents` 与 `self.agent` 分别保存什么，当前 Agent 如何参与 invoke / stream URL 拼接？
+3. `_parse_stream_line()` 如何处理 token、message、error 和 `[DONE]`，`astream()` 为什么属于异步生成器？
+4. `streaming_content`、`streaming_placeholder` 和 `call_results` 分别如何展示 token 与工具调用？
+5. 为什么 AppTest 的外层 timeout 不一定是真正根因，本次如何通过 `tmp_path` 与 `monkeypatch` 修复 `Path.home()`？
+
+Phase 1 至 Phase 11 均已逐项学习并验收通过。

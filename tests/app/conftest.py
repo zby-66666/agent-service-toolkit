@@ -7,14 +7,18 @@ from schema.models import OpenAIModelName
 
 
 @pytest.fixture
-def mock_agent_client(mock_env):
+def mock_agent_client(mock_env, monkeypatch, tmp_path):
     """Fixture for creating a mock AgentClient with a clean environment."""
-
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     mock_info = ServiceMetadata(
         default_agent="test-agent",
         agents=[
             AgentInfo(key="test-agent", description="Test agent"),
             AgentInfo(key="chatbot", description="Chatbot"),
+            AgentInfo(
+                key="ticket-assistant",
+                description="Ticket assistant",
+            ),
         ],
         default_model=OpenAIModelName.GPT_5_NANO,
         models=[OpenAIModelName.GPT_5_NANO, OpenAIModelName.GPT_5_MINI],
