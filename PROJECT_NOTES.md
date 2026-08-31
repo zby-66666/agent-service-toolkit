@@ -14,10 +14,11 @@ Phase 8：✅ 已完成（2026-08-30）
 Phase 9：✅ 已完成（2026-08-30）
 Phase 10：✅ 已完成（2026-08-30）
 Phase 11：✅ 已完成（2026-08-31）
-Phase 12～14：未开始
+Phase 12：✅ 已完成（2026-09-01）
+Phase 13～14：未开始
 ```
 
-当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验、本地 Cross-Encoder Reranker、独立企业工单数据层、Ticket Tools、Ticket Agent Graph、Service / FastAPI 接入，以及 Streamlit 端到端验证。现有客户端本身已经支持动态 Agent，因此没有修改生产客户端代码。
+当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验、本地 Cross-Encoder Reranker、独立企业工单数据层、Ticket Tools、Ticket Agent Graph、Service / FastAPI 接入、Streamlit 端到端验证，以及基于 SQLite Checkpointer 的多轮对话 Memory 验证。下一阶段再开始 MCP。
 
 ## 项目基线
 
@@ -1191,9 +1192,100 @@ RuntimeError: Could not determine home directory.
 - 改得动：能够给 UI mock 增加 Agent，并修改 AppTest 验证选择结果。
 - 会排错：能从外层 timeout 继续追查到底层线程异常，并用 `tmp_path` 与 `monkeypatch` 隔离测试环境。
 
+## Phase 12：多轮对话 Memory
+
+### 1. 核心概念
+
+- LangGraph State：Agent 当前执行所需的完整状态。
+- `messages`：State 中保存消息历史的一个字段。
+- Checkpoint：某一时刻的完整 Graph State 快照。
+- Checkpointer：负责保存和读取 Checkpoint。
+- `thread_id`：标识一段具体对话，是恢复 thread 范围短期记忆的主要 key。
+- `user_id`：标识用户，用于归类该用户的多个 thread，并为跨 thread Store 提供用户范围。
+
+相同 `user_id`、不同 `thread_id` 的对话不会自动共享短期消息历史。
+
+### 2. Checkpointer 初始化
+
+FastAPI 启动时，`lifespan()` 调用 `initialize_database()`。当前默认 SQLite 配置创建 `AsyncSqliteSaver`，随后通过：
+
+```python
+agent.checkpointer = saver
+```
+
+把同一个 Checkpointer 注入已加载的 Agent。SQLite 数据保存在 `checkpoints.db`，与保存客户、设备、工单和维修记录的 `data/business.db` 职责不同。
+
+### 3. 多轮调用链
+
+```text
+客户端发送 message、thread_id、user_id
+↓
+_handle_input() 创建 RunnableConfig
+↓
+configurable.thread_id 确定对话 State
+metadata 记录 user_id 与 agent_id
+↓
+LangGraph 通过 Checkpointer 恢复旧 State
+↓
+MessagesState / add_messages 合并新的 HumanMessage
+↓
+Graph 执行并保存新 Checkpoint
+```
+
+客户端第二轮只需要发送新消息并复用相同 `thread_id`，不需要重新发送第一轮全部历史。
+
+### 4. `/history` 与 `/threads`
+
+- `/history`：根据 `agent_id + thread_id` 返回一段对话的完整 `ChatHistory.messages`。
+- `/threads`：根据 `user_id + agent_id` 返回该用户在指定 Agent 下的会话摘要列表。
+- Streamlit 的 Previous Chats 先调用 `/threads`，用户点击后再调用 `/history`，最后把消息写入 `st.session_state.messages`。
+- New Chat 只清空页面消息并生成新 `thread_id`，不会删除旧 Checkpoint。
+
+`st.session_state.messages` 是前端页面状态；Checkpoint 中的 `messages` 是服务端持久化的 LangGraph State 字段，两者不能混为一谈。
+
+### 5. Checkpointer 与 Store
+
+```text
+Checkpointer
+→ thread 范围短期对话记忆
+
+Store
+→ 跨 thread 的用户记忆
+```
+
+“短期/长期”描述作用范围，不等同于存储介质。当前 SQLite Checkpointer 写入磁盘，服务重启后仍存在；SQLite 模式的 Store 使用 `InMemoryStore`，服务重启后会丢失。
+
+### 6. 真实验证
+
+- 使用相同 `thread_id` 完成两轮 Ticket 对话；第二轮通过指代词使用第一轮 ToolMessage，没有重复调用工具。
+- `/history` 返回 `human → ai(tool_calls) → tool → ai → human → ai` 共 6 条消息。
+- 重启 FastAPI 后仍能从 `checkpoints.db` 恢复相同 6 条消息，证明 SQLite Checkpoint 持久化。
+- 同一 `user_id` 创建两个不同 thread，`/threads` 能同时列出，但各自 `/history` 分别只有 6 条和 2 条消息，证明 State 隔离。
+
+### 7. 自动化测试
+
+在 `tests/service/test_service_real_graphs.py` 新增 `test_invoke_isolates_state_between_threads`：
+
+```text
+thread-a 第一次 → heard 1 messages
+thread-b 第一次 → heard 1 messages
+thread-a 第二次 → heard 3 messages
+```
+
+参数化 fixture 让同一测试分别使用 `MemorySaver` 和 `AsyncSqliteSaver` 执行，两项均通过。
+
+完整相关回归中 54 项通过，唯一一次失败是 Streamlit AppTest 默认 3 秒偶发超时。该测试没有底层线程异常，单项连续两次分别在 2.74 秒和 2.56 秒通过，因此判断为测试环境时序波动，暂不扩大代码改动。
+
+## Phase 12 四关验收
+
+- 看得懂：能区分 State、messages、Checkpoint、Checkpointer、Store、`thread_id` 与 `user_id`。
+- 讲得清：能说明相同 thread 的 State 恢复、不同 thread 的隔离，以及 `/threads → /history → Streamlit` 调用链。
+- 改得动：能够为 MemorySaver 与 SQLiteSaver 增加相同的 thread 隔离回归测试。
+- 会排错：能区分客户端页面状态、服务端 Checkpoint、业务数据库、固定功能失败和偶发测试超时。
+
 ## 下一阶段需要理解的内容
 
-实际学习过程中额外拆出了 Service / API 接入和 Streamlit 接入两个阶段。下一阶段先回到原路线中尚未完成的 Memory，学习 `thread_id`、`user_id`、MessagesState、Checkpoint、历史读取与多轮对话恢复；暂不提前加入 MCP。
+Phase 13 开始 MCP：先理解普通 BaseTool 与 MCP Tool 的边界，再创建最小 ticket MCP Server，只暴露少量只读工具并接入 Agent；暂不提前做 Docker、Evaluation 或求职材料。
 
 ## 面试问题
 
@@ -1284,4 +1376,12 @@ RuntimeError: Could not determine home directory.
 4. `streaming_content`、`streaming_placeholder` 和 `call_results` 分别如何展示 token 与工具调用？
 5. 为什么 AppTest 的外层 timeout 不一定是真正根因，本次如何通过 `tmp_path` 与 `monkeypatch` 修复 `Path.home()`？
 
-Phase 1 至 Phase 11 均已逐项学习并验收通过。
+### Phase 12
+
+1. LangGraph State、`messages`、Checkpoint 和 Checkpointer 分别是什么，它们之间有什么关系？
+2. `thread_id` 与 `user_id` 分别解决什么问题，为什么相同用户的不同 thread 不共享短期历史？
+3. 第二轮请求复用相同 `thread_id` 时，旧 State 如何恢复，新 HumanMessage 如何与旧 messages 合并？
+4. Checkpointer 与 Store 的记忆范围有什么区别，为什么 SQLite Checkpointer 可以持久化，而当前 InMemoryStore 重启后会丢失？
+5. `/threads`、`/history` 和 Streamlit Previous Chats 如何协作，如何测试同一用户的不同 thread 相互隔离？
+
+Phase 1 至 Phase 12 均已逐项学习并验收通过。

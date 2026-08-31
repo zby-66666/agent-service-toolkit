@@ -207,6 +207,33 @@ async def test_invoke_accumulates_state_across_turns(checkpointer) -> None:
 
 
 @pytest.mark.asyncio
+async def test_invoke_isolates_state_between_threads(checkpointer) -> None:
+    agents = {"counting-agent": build_counting_agent(checkpointer)}
+
+    async with client_for(agents) as client:
+        first_a = await client.post(
+            "/counting-agent/invoke",
+            json={"message": "first A", "thread_id": "thread-a"},
+        )
+        first_b = await client.post(
+            "/counting-agent/invoke",
+            json={"message": "first B", "thread_id": "thread-b"},
+        )
+        second_a = await client.post(
+            "/counting-agent/invoke",
+            json={"message": "second A", "thread_id": "thread-a"},
+        )
+
+        assert first_a.status_code == 200
+        assert first_b.status_code == 200
+        assert second_a.status_code == 200
+
+        assert first_a.json()["content"] == "heard 1 messages"
+        assert first_b.json()["content"] == "heard 1 messages"
+        assert second_a.json()["content"] == "heard 3 messages"
+
+
+@pytest.mark.asyncio
 async def test_invoke_returns_only_the_final_message() -> None:
     """Pins the documented limitation: intermediate AIMessages are dropped by /invoke."""
     agents = {"two-step-agent": build_two_step_agent(MemorySaver())}
