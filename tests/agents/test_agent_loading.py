@@ -12,6 +12,7 @@ from agents.agents import (
 )
 from agents.lazy_agent import LazyLoadingAgent
 from agents.ticket_assistant import ticket_assistant
+from agents.ticket_mcp_agent import ticket_mcp_agent
 
 
 class TestAgentLoading:
@@ -86,4 +87,20 @@ class TestAgentLoading:
         assert info_by_key["ticket-assistant"].description == (
             "An AcmeTech support ticket assistant with access to "
             "customer tickets and device repair history."
+        )
+
+    def test_ticket_mcp_agent_registered(self):
+        """验证 Ticket MCP Agent 已作为懒加载 Agent 注册。"""
+        registered_agent = agents["ticket-mcp-agent"]
+        info_by_key = {item.key: item for item in get_all_agent_info()}
+
+        assert registered_agent.graph_like is ticket_mcp_agent
+        assert isinstance(
+            registered_agent.graph_like,
+            LazyLoadingAgent,
+        )
+        assert "ticket-mcp-agent" in info_by_key
+        assert info_by_key["ticket-mcp-agent"].description == (
+            "An AcmeTech support ticket assistant that accesses "
+            "ticket data through a local MCP server."
         )

@@ -15,10 +15,11 @@ Phase 9：✅ 已完成（2026-08-30）
 Phase 10：✅ 已完成（2026-08-30）
 Phase 11：✅ 已完成（2026-08-31）
 Phase 12：✅ 已完成（2026-09-01）
-Phase 13～14：未开始
+Phase 13：✅ 已完成（2026-09-02）
+Phase 14～16：未开始
 ```
 
-当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验、本地 Cross-Encoder Reranker、独立企业工单数据层、Ticket Tools、Ticket Agent Graph、Service / FastAPI 接入、Streamlit 端到端验证，以及基于 SQLite Checkpointer 的多轮对话 Memory 验证。下一阶段再开始 MCP。
+当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验、本地 Cross-Encoder Reranker、独立企业工单数据层、Ticket Tools、Ticket Agent Graph、Service / FastAPI 接入、Streamlit 端到端验证、基于 SQLite Checkpointer 的多轮对话 Memory 验证，以及本地 stdio Ticket MCP Server 与 MCP Agent 接入。下一阶段开始工程化与 Docker。
 
 ## 项目基线
 
@@ -1283,9 +1284,185 @@ thread-a 第二次 → heard 3 messages
 - 改得动：能够为 MemorySaver 与 SQLiteSaver 增加相同的 thread 隔离回归测试。
 - 会排错：能区分客户端页面状态、服务端 Checkpoint、业务数据库、固定功能失败和偶发测试超时。
 
+## Phase 13：MCP
+
+### 1. 普通 Tool 与 MCP Tool 的边界
+
+普通 `ticket-assistant` 直接导入并执行进程内的 Python Tool：
+
+```text
+Agent Service 进程
+↓
+ToolNode
+↓
+src/agents/ticket_tools.py
+↓
+src/business/queries.py
+↓
+data/business.db
+```
+
+`ticket-mcp-agent` 不直接导入业务工具，而是作为 MCP Client，通过 stdio 请求独立的 Ticket MCP Server 子进程执行：
+
+```text
+Agent Service 父进程
+↓
+MCP Client
+↓ stdin/stdout
+Ticket MCP Server 子进程
+↓
+src/business/queries.py
+↓
+data/business.db
+```
+
+两种方式最终查询同一业务数据层，但 MCP 在 Agent 与工具实现之间增加了标准协议边界，工具可以被不同 MCP Client 发现和调用。
+
+### 2. Ticket MCP Server
+
+`src/mcp_servers/ticket_server.py` 使用 `FastMCP` 暴露两个只读工具：
+
+- `get_customer_tickets(customer_id)`：查询客户工单。
+- `get_device_repair_history(serial_number)`：查询设备工单与维修历史。
+
+Server 通过：
+
+```python
+mcp.run(transport="stdio")
+```
+
+使用标准输入和标准输出传输 MCP 协议。stdio 中的普通输出可能污染协议，因此不能随意使用 `print()` 输出调试信息。
+
+### 3. MCP Client 与工具发现
+
+`MultiServerMCPClient` 根据 `StdioConnection` 启动本地 MCP Server。连接配置包含：
+
+- `command`：当前虚拟环境的 Python。
+- `args`：以模块方式运行 `mcp_servers.ticket_server`。
+- `cwd`：项目根目录。
+- `PYTHONPATH`：加入项目的 `src` 目录。
+
+`await client.get_tools()` 完成：
+
+```text
+连接 MCP Server
+↓
+读取工具名称、说明和参数 Schema
+↓
+转换成 LangChain BaseTool
+↓
+返回 list[BaseTool]
+```
+
+因此发现的 MCP 工具可以直接传给 `create_agent(tools=...)`。
+
+### 4. MCP 返回值与 ID
+
+MCP Server 与 Client 位于不同进程，不能直接传递 Python `dict` 对象。返回值会经历：
+
+```text
+Python dict
+↓ FastMCP 序列化
+JSON 文本
+↓ MCP 协议包装
+文本 content block
+↓
+list[content block]
+```
+
+三个容易混淆的 ID：
+
+- `AIMessage.tool_calls[].id`：模型生成的工具调用 ID。
+- `ToolMessage.tool_call_id`：把工具结果关联到对应工具请求，必须与上一项相同。
+- MCP 内容块的 `lc_...` ID：标识内容块本身，不负责关联模型调用与工具结果。
+
+### 5. Ticket MCP Agent 与懒加载
+
+`src/agents/ticket_mcp_agent.py` 定义 `TicketMCPAgent`，继承 `LazyLoadingAgent`。模块导入是同步过程，而 MCP 工具发现需要：
+
+```python
+await client.get_tools()
+```
+
+因此 FastAPI 在异步 `lifespan()` 中调用 `load()`：
+
+```text
+lifespan()
+↓
+load_agent("ticket-mcp-agent")
+↓
+TicketMCPAgent.load()
+↓
+创建 MultiServerMCPClient
+↓
+await get_tools()
+↓
+create_agent(model, MCP tools)
+↓
+保存 CompiledStateGraph
+```
+
+`ticket-mcp-agent` 注册到动态 Agent 注册表后，自动出现在 `/info`，并复用现有的 `/{agent_id}/invoke` 和 `/{agent_id}/stream`，不需要新增 FastAPI 路由。
+
+### 6. 完整 MCP Agent 调用链
+
+```text
+POST /ticket-mcp-agent/invoke 或 /stream
+↓
+FastAPI 根据 agent_id 选择已加载的 Graph
+↓
+Qwen 第一次执行并生成 AIMessage.tool_calls
+↓
+create_agent 内部工具执行节点
+↓
+LangChain MCP BaseTool
+↓
+MCP Client 通过 stdio 调用 Ticket MCP Server
+↓
+business/queries.py 查询 SQLite
+↓
+MCP 返回文本 content block
+↓
+工具执行节点生成 ToolMessage
+↓
+Qwen 第二次整理工具结果
+↓
+最终 AIMessage
+↓
+FastAPI 返回 JSON 或 SSE
+```
+
+非流式 `/invoke` 只返回最终 AIMessage，因此最终 `tool_calls` 可以为空；流式 `/stream` 能依次看到工具请求、ToolMessage、最终回答、token 和 `[DONE]`。
+
+### 7. 测试分层
+
+- 工具函数单元测试：使用 `monkeypatch` 替换真实业务查询，快速验证计数和返回结构，不访问数据库。
+- stdio 集成测试：真正启动 MCP Server 子进程，通过 `get_tools()` 验证工具发现和参数 Schema，不调用真实模型。
+- MCP Agent 单元测试：使用 `AsyncMock` 模拟异步 `get_tools()`，验证连接配置、懒加载状态和 `create_agent()` 参数。
+- 手工端到端测试：使用真实 Qwen、MCP Server 和 SQLite，验证模型选工具、工具执行和最终答案。
+
+真实模型没有放进普通单元测试，因为它依赖 Ollama、本地模型和运行资源，而且自然语言输出可能变化。
+
+### 8. 验证结果
+
+- MCP Client 成功发现两个工具，并取得正确的 JSON Schema。
+- 客户 1 的 MCP 查询返回 3 张工单。
+- 设备 `SN-ACME-1001` 的 MCP 查询返回 2 张工单和 2 条维修记录。
+- Qwen 能分别选择客户工单工具和设备维修历史工具。
+- `/ticket-mcp-agent/invoke` 返回正确最终答案和 Service `run_id`。
+- `/ticket-mcp-agent/stream` 能看到工具请求、ToolMessage、128 个 token、最终消息和 `[DONE]`。
+- MCP 相关测试与 Service 回归共 39 项通过；5 条 warning 均来自已有依赖的弃用提示。
+
+## Phase 13 四关验收
+
+- 看得懂：能区分普通进程内 Tool、MCP Server、MCP Client、stdio transport 和 MCP BaseTool。
+- 讲得清：能说明工具发现、跨进程序列化、三种 ID，以及 Qwen 通过 MCP 查询业务数据库的完整链路。
+- 改得动：能够创建 FastMCP Server、懒加载 MCP Agent、动态注册项，以及对应单元和集成测试。
+- 会排错：能区分工具发现与工具执行、HTTP 200 与 SSE 业务成功、普通 Ruff 格式问题与功能测试结果。
+
 ## 下一阶段需要理解的内容
 
-Phase 13 开始 MCP：先理解普通 BaseTool 与 MCP Tool 的边界，再创建最小 ticket MCP Server，只暴露少量只读工具并接入 Agent；暂不提前做 Docker、Evaluation 或求职材料。
+Phase 14 开始工程化与 Docker：梳理本地服务、Ollama、SQLite、Qdrant、MCP 子进程和 Streamlit 的启动依赖，再设计最小可用的容器化方案；暂不提前做 Evaluation 或求职材料。
 
 ## 面试问题
 
@@ -1384,4 +1561,12 @@ Phase 13 开始 MCP：先理解普通 BaseTool 与 MCP Tool 的边界，再创�
 4. Checkpointer 与 Store 的记忆范围有什么区别，为什么 SQLite Checkpointer 可以持久化，而当前 InMemoryStore 重启后会丢失？
 5. `/threads`、`/history` 和 Streamlit Previous Chats 如何协作，如何测试同一用户的不同 thread 相互隔离？
 
-Phase 1 至 Phase 12 均已逐项学习并验收通过。
+### Phase 13
+
+1. 普通进程内 Tool Calling 与 MCP Tool Calling 的执行位置、调用方式和复用边界有什么区别？
+2. `MultiServerMCPClient.get_tools()` 完成哪些工作，为什么返回的 `list[BaseTool]` 可以传给 `create_agent()`？
+3. 为什么 Ticket MCP Agent 需要懒加载，FastAPI `lifespan()` 在 MCP Agent 初始化中承担什么职责？
+4. Python `dict` 如何跨进程变成 MCP content block，`tool_calls[].id`、`ToolMessage.tool_call_id` 与 `lc_...` ID 分别有什么作用？
+5. MCP 工具函数单元测试、stdio 集成测试、Agent mock 测试和真实 Qwen 端到端测试分别证明什么？
+
+Phase 1 至 Phase 13 均已逐项学习并验收通过。

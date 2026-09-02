@@ -15,6 +15,7 @@ from agents.lazy_agent import LazyLoadingAgent
 from agents.rag_assistant import rag_assistant
 from agents.research_assistant import research_assistant
 from agents.ticket_assistant import ticket_assistant
+from agents.ticket_mcp_agent import ticket_mcp_agent
 from schema import AgentInfo
 
 DEFAULT_AGENT = "research-assistant"
@@ -48,6 +49,13 @@ agents: dict[str, Agent] = {
             "customer tickets and device repair history."
         ),
         graph_like=ticket_assistant,
+    ),
+    "ticket-mcp-agent": Agent(
+        description=(
+            "An AcmeTech support ticket assistant that accesses "
+            "ticket data through a local MCP server."
+        ),
+        graph_like=ticket_mcp_agent,
     ),
     "command-agent": Agent(description="A command agent.", graph_like=command_agent),
     "bg-task-agent": Agent(description="A background task agent.", graph_like=bg_task_agent),
