@@ -16,10 +16,11 @@ Phase 10：✅ 已完成（2026-08-30）
 Phase 11：✅ 已完成（2026-08-31）
 Phase 12：✅ 已完成（2026-09-01）
 Phase 13：✅ 已完成（2026-09-02）
-Phase 14～16：未开始
+Phase 14：✅ 已完成（2026-09-02）
+Phase 15～16：未开始
 ```
 
-当前阶段边界：已经完成原项目运行验证、核心调用链、原版 RAG 阅读、Qdrant / bge-m3 迁移、Embedding 实验、本地 Cross-Encoder Reranker、独立企业工单数据层、Ticket Tools、Ticket Agent Graph、Service / FastAPI 接入、Streamlit 端到端验证、基于 SQLite Checkpointer 的多轮对话 Memory 验证，以及本地 stdio Ticket MCP Server 与 MCP Agent 接入。下一阶段开始工程化与 Docker。
+当前阶段边界：已经完成 FastAPI、Streamlit、SQLite、Qdrant、MCP 和宿主机 Ollama 的 Docker Compose 编排、运行验证与面试复盘。下一阶段开始 Evaluation，Phase 15 尚未实施。
 
 ## 项目基线
 
@@ -1460,9 +1461,158 @@ FastAPI 返回 JSON 或 SSE
 - 改得动：能够创建 FastMCP Server、懒加载 MCP Agent、动态注册项，以及对应单元和集成测试。
 - 会排错：能区分工具发现与工具执行、HTTP 200 与 SSE 业务成功、普通 Ruff 格式问题与功能测试结果。
 
+## Phase 14：工程化与 Docker
+
+### 1. 容器架构
+
+当前容器化架构为：
+
+```text
+Windows 宿主机
+├─ Ollama
+│  ├─ qwen3:4b
+│  └─ bge-m3
+│
+└─ Docker Compose
+   ├─ agent_service
+   │  ├─ FastAPI
+   │  ├─ LangGraph Agents
+   │  └─ Ticket MCP Server 子进程
+   │
+   └─ streamlit_app
+```
+
+- 容器中的 `localhost` 指当前容器，不是 Windows 宿主机。
+- `agent_service` 使用 `host.docker.internal:11434` 访问宿主机 Ollama。
+- `streamlit_app` 使用 Compose 服务名 `agent_service:8080` 访问 FastAPI。
+- Postgres 被配置为可选 profile，当前默认使用 SQLite Checkpointer。
+
+### 2. Service 镜像结构
+
+`docker/Dockerfile.service` 保留项目原有的 `src` 目录结构：
+
+```text
+/app
+└─ src
+   ├─ agents
+   ├─ business
+   ├─ core
+   ├─ mcp_servers
+   ├─ memory
+   ├─ schema
+   ├─ service
+   └─ run_service.py
+```
+
+通过 `ENV PYTHONPATH="/app/src"` 让 Python 能从 `/app/src` 导入 `agents`、`business` 和 `mcp_servers` 等包。Service 最终通过 `CMD ["python", "src/run_service.py"]` 启动 FastAPI。
+
+### 3. 数据挂载设计
+
+```text
+./data:/app/data:ro
+```
+
+- 使用 Bind Mount，由 Windows 宿主机管理已有业务数据。
+- `:ro` 表示容器只能读取 `data/business.db`，不能修改宿主机业务数据库。
+
+```text
+./qdrant_data:/app/qdrant_data
+```
+
+- 使用 Bind Mount，让容器直接读取宿主机已有的 Qdrant Collection。
+- 嵌入式 Qdrant 需要管理文件锁，因此该目录没有设置只读。
+- 本地 Service 与容器 Service 不应同时打开同一个嵌入式 Qdrant 目录。
+
+```text
+checkpoint_data:/app/state
+```
+
+- 使用 Docker Named Volume 保存容器运行时产生的状态。
+- SQLite Checkpointer 写入 `/app/state/checkpoints.db`。
+- 容器删除并重新创建后，Checkpoint 仍然保留。
+
+### 4. Docker Compose 编排
+
+默认启动 `agent_service` 和 `streamlit_app` 两个服务。`streamlit_app` 使用 `depends_on` 和 `condition: service_healthy` 等待 FastAPI 健康后再启动，避免前端启动时无法取得 `/info`。
+
+健康检查使用 Python 标准库 `urllib.request`，不依赖精简镜像中可能不存在的 `curl`。Postgres 使用 `postgres` profile，不会在默认的 `docker compose up` 中启动。
+
+### 5. 完整调用链
+
+```text
+浏览器
+↓
+Streamlit 容器
+↓ http://agent_service:8080
+FastAPI 容器
+↓
+ticket-mcp-agent
+↓
+MCP Client
+↓ stdin/stdout
+Ticket MCP Server 子进程
+↓
+/app/data/business.db
+↓
+ToolMessage
+↓ http://host.docker.internal:11434
+Windows Ollama / qwen3:4b
+↓
+最终答案返回 Streamlit
+```
+
+### 6. Checkpoint 持久化验证
+
+使用固定 `thread_id` 完成一次工具调用后：
+
+```text
+docker compose down
+↓
+旧容器被删除
+↓
+checkpoint_data Named Volume 保留
+↓
+docker compose up -d
+↓
+新容器重新挂载 Volume
+↓
+/history 恢复原来的 4 条消息
+```
+
+恢复的消息顺序为 `human → ai(tool_calls) → tool → ai`。这证明 Checkpoint 不依赖原来的容器，而是持久保存在 Named Volume 中。
+
+### 7. 常用 Docker 命令与边界
+
+- `docker compose up -d`：在后台启动服务。
+- `docker compose ps`：查看服务和健康状态。
+- `docker compose down`：删除容器和网络，默认保留 Named Volume。
+- `docker compose down --volumes`：同时删除 Named Volume，可能丢失 Checkpoint。
+- `docker compose config --quiet`：检查 Compose 配置。
+- `docker build --check`：检查 Dockerfile。
+- `docker compose logs`：查看容器日志。
+
+### 8. 验证结果
+
+- Service Dockerfile 检查无警告，镜像构建成功。
+- 容器能够导入 Business、Agent 和 MCP Server 模块。
+- 容器能够读取宿主机业务数据库和 Qdrant 数据。
+- 容器能够通过 `host.docker.internal` 访问 Windows Ollama。
+- FastAPI 与 Streamlit 健康检查均返回 HTTP 200。
+- `ticket-mcp-agent` 的 invoke、MCP 工具调用和最终回答正常。
+- Named Volume 能在容器重建后恢复 Checkpoint。
+- `docker compose config --quiet` 和 `git diff --check` 均通过。
+- 相关回归测试中 44 项通过；唯一一次 Streamlit AppTest 触发默认 3 秒超时，单项复测在 2.76 秒通过，确认不是功能错误。
+
+## Phase 14 四关验收
+
+- 看得懂：能区分镜像、容器、Bind Mount、Named Volume、Compose 服务名和容器内 `localhost`。
+- 讲得清：能说明 Streamlit、FastAPI、MCP Server、业务数据库和宿主机 Ollama 的容器调用链。
+- 改得动：能够修改 Dockerfile、Compose 服务、健康检查、环境变量和数据挂载。
+- 会排错：能区分容器导入失败、宿主机网络地址、Qdrant 文件锁、健康检查和测试偶发超时。
+
 ## 下一阶段需要理解的内容
 
-Phase 14 开始工程化与 Docker：梳理本地服务、Ollama、SQLite、Qdrant、MCP 子进程和 Streamlit 的启动依赖，再设计最小可用的容器化方案；暂不提前做 Evaluation 或求职材料。
+Phase 15 开始 Evaluation：为 RAG、Ticket Tool Calling 和 Agent 最终答案设计可重复执行的质量评估，暂不提前扩展求职材料。
 
 ## 面试问题
 
@@ -1569,4 +1719,12 @@ Phase 14 开始工程化与 Docker：梳理本地服务、Ollama、SQLite、Qdra
 4. Python `dict` 如何跨进程变成 MCP content block，`tool_calls[].id`、`ToolMessage.tool_call_id` 与 `lc_...` ID 分别有什么作用？
 5. MCP 工具函数单元测试、stdio 集成测试、Agent mock 测试和真实 Qwen 端到端测试分别证明什么？
 
-Phase 1 至 Phase 13 均已逐项学习并验收通过。
+### Phase 14
+
+1. 镜像、容器、Bind Mount 和 Named Volume 分别是什么？
+2. 为什么容器不能用 `localhost:11434` 访问宿主机 Ollama？
+3. Compose 服务之间为什么可以通过 `agent_service:8080` 通信？
+4. 为什么业务数据库使用只读 Bind Mount，而 Checkpoint 使用 Named Volume？
+5. `docker compose down` 与 `docker compose down --volumes` 有什么区别？
+
+Phase 1 至 Phase 14 均已逐项学习并验收通过。

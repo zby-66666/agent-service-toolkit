@@ -1,16 +1,20 @@
 services:
   postgres:
     image: postgres:16
+    profiles:
+      - postgres
     ports:
       - "5432:5432"
     environment:
-      - POSTGRES_USER=${POSTGRES_USER:-postgres}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
-      - POSTGRES_DB=${POSTGRES_DB:-agent_service}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-agent_service}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-postgres}
       interval: 5s
       timeout: 5s
       retries: 5
@@ -23,34 +27,52 @@ services:
       - "8080:8080"
     env_file:
       - .env
-    depends_on:
-      postgres:
-        condition: service_healthy
+    environment:
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      MODE: ""
+      DATABASE_TYPE: sqlite
+      SQLITE_DB_PATH: /app/state/checkpoints.db
+    volumes:
+      - ./privatecredentials:/privatecredentials
+      - ./data:/app/data:ro
+      - ./qdrant_data:/app/qdrant_data
+      - checkpoint_data:/app/state
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/info"]
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen("http://localhost:8080/health", timeout=5)
       interval: 5s
       timeout: 5s
       retries: 5
-    # Volume mount of development-only credentials since compose watch doesn't sync ignored files and doesn't do initial sync when the service starts
-    volumes:
-      - ./privatecredentials:/privatecredentials
+      start_period: 20s
     develop:
       watch:
         - path: src/agents/
           action: sync+restart
-          target: /app/agents/
-        - path: src/schema/
+          target: /app/src/agents/
+        - path: src/business/
           action: sync+restart
-          target: /app/schema/
-        - path: src/service/
-          action: sync+restart
-          target: /app/service/
+          target: /app/src/business/
         - path: src/core/
           action: sync+restart
-          target: /app/core/
+          target: /app/src/core/
+        - path: src/mcp_servers/
+          action: sync+restart
+          target: /app/src/mcp_servers/
         - path: src/memory/
           action: sync+restart
-          target: /app/memory/
+          target: /app/src/memory/
+        - path: src/schema/
+          action: sync+restart
+          target: /app/src/schema/
+        - path: src/service/
+          action: sync+restart
+          target: /app/src/service/
+
   streamlit_app:
     build:
       context: .
@@ -58,14 +80,22 @@ services:
     ports:
       - "8501:8501"
     depends_on:
-      - agent_service
+      agent_service:
+        condition: service_healthy
+    environment:
+      AGENT_URL: http://agent_service:8080
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8501/healthz"]
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen("http://localhost:8501/healthz", timeout=5)
       interval: 5s
       timeout: 5s
       retries: 5
-    environment:
-      - AGENT_URL=http://agent_service:8080
+      start_period: 20s
     develop:
       watch:
         - path: src/client/
@@ -80,3 +110,4 @@ services:
 
 volumes:
   postgres_data:
+  checkpoint_data:
