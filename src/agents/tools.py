@@ -12,6 +12,8 @@ from langchain_ollama import OllamaEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 
+from core.settings import settings
+
 QDRANT_PATH = "./qdrant_data"
 COLLECTION_NAME = "employee_handbook"
 EMBEDDING_MODEL = "bge-m3"
@@ -107,7 +109,10 @@ def rerank_documents(
 
 def load_qdrant_db():
     """Open the local Qdrant collection and create its retriever."""
-    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+    embeddings = OllamaEmbeddings(
+        model=EMBEDDING_MODEL,
+        base_url=settings.OLLAMA_BASE_URL,
+    )
     client = QdrantClient(path=QDRANT_PATH)
 
     try:

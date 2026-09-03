@@ -186,6 +186,9 @@ cython_debug/
 # Qdrant local storage
 /qdrant_data/
 
+# Generated local evaluation reports
+/evals/results/
+
 # Private Credentials, ignore everything in the folder but the .gitkeep file
 privatecredentials/*
 !privatecredentials/.gitkeep

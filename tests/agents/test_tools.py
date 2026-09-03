@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock
+
 import pytest
 from langchain_core.documents import Document
 
@@ -86,3 +88,48 @@ def test_rerank_documents_rejects_mismatched_score_count(
         match="different number of scores",
     ):
         tools.rerank_documents("question", documents)
+
+
+def test_load_qdrant_db_uses_configured_ollama_base_url(monkeypatch):
+    ollama_base_url = "http://host.docker.internal:11434"
+
+    embeddings = object()
+    retriever = object()
+
+    embeddings_factory = MagicMock(return_value=embeddings)
+
+    client = MagicMock()
+    client.collection_exists.return_value = True
+
+    vector_store = MagicMock()
+    vector_store.as_retriever.return_value = retriever
+
+    monkeypatch.setattr(
+        tools.settings,
+        "OLLAMA_BASE_URL",
+        ollama_base_url,
+    )
+    monkeypatch.setattr(
+        tools,
+        "OllamaEmbeddings",
+        embeddings_factory,
+    )
+    monkeypatch.setattr(
+        tools,
+        "QdrantClient",
+        MagicMock(return_value=client),
+    )
+    monkeypatch.setattr(
+        tools,
+        "QdrantVectorStore",
+        MagicMock(return_value=vector_store),
+    )
+
+    returned_client, returned_retriever = tools.load_qdrant_db()
+
+    embeddings_factory.assert_called_once_with(
+        model=tools.EMBEDDING_MODEL,
+        base_url=ollama_base_url,
+    )
+    assert returned_client is client
+    assert returned_retriever is retriever

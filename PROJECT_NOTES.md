@@ -17,10 +17,11 @@ Phase 11：✅ 已完成（2026-08-31）
 Phase 12：✅ 已完成（2026-09-01）
 Phase 13：✅ 已完成（2026-09-02）
 Phase 14：✅ 已完成（2026-09-02）
-Phase 15～16：未开始
+Phase 15：✅ 已完成（2026-09-03）
+Phase 16：未开始
 ```
 
-当前阶段边界：已经完成 FastAPI、Streamlit、SQLite、Qdrant、MCP 和宿主机 Ollama 的 Docker Compose 编排、运行验证与面试复盘。下一阶段开始 Evaluation，Phase 15 尚未实施。
+当前阶段边界：已经完成 FastAPI、Streamlit、SQLite、Qdrant、MCP、Docker Compose 和真实 Agent Evaluation。Phase 15 已完成规则评估、故障定位、超时治理和面试复盘；Phase 16 尚未开始。
 
 ## 项目基线
 
@@ -1610,9 +1611,128 @@ docker compose up -d
 - 改得动：能够修改 Dockerfile、Compose 服务、健康检查、环境变量和数据挂载。
 - 会排错：能区分容器导入失败、宿主机网络地址、Qdrant 文件锁、健康检查和测试偶发超时。
 
+## Phase 15：真实 Agent Evaluation
+
+### 1. 本阶段目标
+
+为真实运行的 Agent 建立一个简单、可重复执行、能够定位故障层级的本地评估框架。第一版使用确定性规则评分，不引入 LLM-as-a-Judge，也不提前接入 LangSmith Evaluation。
+
+评估覆盖：
+
+- 无工具普通回答；
+- RAG 知识库检索；
+- 客户工单查询；
+- 设备维修记录查询；
+- 未知设备边界情况。
+
+### 2. 评估代码职责
+
+- `evals/cases.json`：保存问题、Agent、预期工具、参数、工具内容和最终答案事实。
+- `evals/collector.py`：消费 `AgentClient.astream()`，收集工具请求、工具结果和最终 AIMessage。
+- `evals/scoring.py`：分别计算工具、参数、工具内容和答案是否通过。
+- `evals/runner.py`：为单条 Case 创建独立 `thread_id`，执行一次真实 Agent 请求并记录延迟。
+- `evals/run_evaluation.py`：顺序运行全部 Case、隔离单条异常、汇总指标并写入 JSON 报告。
+- `tests/evals/`：验证收集、评分、单条执行、错误隔离、汇总和报告生成逻辑。
+- `evals/results/`：保存本地生成的评估报告，已加入 `.gitignore`。
+
+### 3. 完整评估调用链
+
+```text
+cases.json
+↓
+run_evaluation.py 顺序读取 Case
+↓
+runner.py 创建新的 thread_id
+↓
+AgentClient.astream(stream_tokens=False)
+↓
+真实 FastAPI / LangGraph / Qwen / Tool
+↓
+collector.py 收集 AIMessage.tool_calls、ToolMessage、最终 AIMessage
+↓
+scoring.py 分层评分
+↓
+run_evaluation.py 汇总正确率与延迟
+↓
+evals/results/latest.json
+```
+
+使用 `/stream` 而不是只使用 `/invoke`，是因为评估需要看到工具请求和工具结果。关闭 token 流只是不逐字收集输出，不会丢掉完整的 message 事件。
+
+### 4. 分层评分
+
+- `tool_pass`：模型是否选择了预期工具。
+- `arguments_pass`：工具调用参数是否包含预期字段和值。
+- `tool_content_pass`：工具结果是否包含预期业务事实。
+- `answer_pass`：最终自然语言答案是否包含关键事实。
+- `passed`：以上全部条件是否同时通过。
+
+分层评分能够区分工具选择错误、参数错误、工具执行或检索错误，以及最终回答整理错误，避免只看最终答案后误判根因。
+
+### 5. 隔离、容错与延迟
+
+- 所有 Case 使用同一个 Evaluation `user_id`，便于归类。
+- 每条 Case 使用新的 UUID `thread_id`，防止 Checkpoint 历史污染后续评估。
+- Case 按顺序运行，避免单机 Ollama 并发争抢资源。
+- 单条 Case 发生异常时继续运行后续 Case，避免只知道第一个错误。
+- `perf_counter()` 用于测量经过时间，不受系统时钟调整影响。
+- 成功和失败 Case 都记录耗时，避免排除超时失败后人为降低平均延迟。
+- 默认 HTTP 超时为 600 秒，并支持 `--timeout-seconds` 按运行环境调整。
+
+### 6. Evaluation 驱动的 Debug 记录
+
+第一次真实基线结果为 4/5，`rag-pto-001` 失败。分层结果显示工具名称和参数正确，但工具内容为空、最终回答为内部错误，因此问题位于检索执行阶段，而不是工具选择阶段。
+
+根因是：
+
+```text
+容器中的 ChatOllama
+→ 使用 settings.OLLAMA_BASE_URL
+→ 能访问 Windows Ollama
+
+容器中的 OllamaEmbeddings
+→ 最初没有传入 OLLAMA_BASE_URL
+→ 默认访问容器自己的 localhost:11434
+→ Query Embedding 连接失败
+```
+
+修复后，`load_qdrant_db()` 创建 `OllamaEmbeddings` 时传入 `settings.OLLAMA_BASE_URL`，并增加回归测试验证该参数不会再次遗漏。
+
+后续一次运行出现 `AgentClientError`。报告中的 `actual=null` 和 `latency_seconds=null` 表明请求在返回评估数据前异常。结合原来硬编码的 180 秒超时和 RAG 曾耗时 231.606 秒，确认评估器需要允许慢速本地模型完成，并且必须记录失败耗时。因此加入可配置的 600 秒默认超时和失败计时。
+
+### 7. 最终真实基线
+
+```text
+chat-no-tool-001：PASS，11.51 秒
+rag-pto-001：PASS，100.29 秒
+ticket-customer-001：PASS，30.40 秒
+ticket-repair-001：PASS，45.64 秒
+ticket-unknown-device-001：PASS，76.06 秒
+
+通过：5/5
+正确率：100.0%
+平均延迟：52.781 秒
+```
+
+该结果只证明当前 5 条样例在本次环境中通过，不代表所有真实问题都能正确回答。延迟指标作为后续性能优化的本地基线，不在本阶段过度扩展优化范围。
+
+### 8. 验证结果
+
+- Evaluation 相关代码 Ruff 检查通过，10 个文件格式检查通过。
+- Evaluation、RAG Tool 和 AgentClient 相关测试共 27 项通过。
+- 真实 Docker Compose Agent Evaluation 最终 5/5 通过。
+- 生成报告包含运行时间、服务地址、超时配置、逐条实际结果、分层评分和延迟。
+
+## Phase 15 四关验收
+
+- 看得懂：能说明 Case、Collector、Scoring、Runner 和 Report 的职责。
+- 讲得清：能解释 pytest 与真实 Evaluation、`/invoke` 与 `/stream`、分层评分和独立 `thread_id` 的区别。
+- 改得动：能够增加 Case、调整规则、配置超时并读取 JSON 报告。
+- 会排错：能够根据工具、参数、工具内容和答案分数定位失败层级，并识别容器 Ollama 地址和客户端超时问题。
+
 ## 下一阶段需要理解的内容
 
-Phase 15 开始 Evaluation：为 RAG、Ticket Tool Calling 和 Agent 最终答案设计可重复执行的质量评估，暂不提前扩展求职材料。
+Phase 16 开始求职整理：提炼项目亮点、架构说明、简历描述和面试讲解。当前尚未开始，不提前扩展。
 
 ## 面试问题
 
@@ -1727,4 +1847,12 @@ Phase 15 开始 Evaluation：为 RAG、Ticket Tool Calling 和 Agent 最终答�
 4. 为什么业务数据库使用只读 Bind Mount，而 Checkpoint 使用 Named Volume？
 5. `docker compose down` 与 `docker compose down --volumes` 有什么区别？
 
-Phase 1 至 Phase 14 均已逐项学习并验收通过。
+### Phase 15
+
+1. pytest 单元测试与真实 Agent Evaluation 的目标、依赖和稳定性有什么区别？
+2. 为什么工具调用评估需要读取 `/stream` 中的 AIMessage.tool_calls 和 ToolMessage，而不能只看最终答案？
+3. 为什么每条 Evaluation Case 必须使用新的 `thread_id`，相同 `user_id` 是否会共享短期对话 State？
+4. `tool_pass`、`arguments_pass`、`tool_content_pass` 和 `answer_pass` 分别定位哪一层问题？
+5. 为什么失败 Case 也必须记录延迟，超时为什么应该根据运行环境配置？
+
+Phase 1 至 Phase 15 均已逐项学习并验收通过。

@@ -1,0 +1,99 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "chat-no-tool-001",
+      "category": "normal_chat",
+      "agent_id": "ticket-mcp-agent",
+      "question": "Say hello in one short sentence without using any tools.",
+      "expected": {
+        "tool_name": null,
+        "tool_arguments": {},
+        "tool_content_contains": [],
+        "answer_contains_all": [],
+        "answer_contains_any": ["hello", "hi"]
+      }
+    },
+    {
+      "id": "rag-pto-001",
+      "category": "rag",
+      "agent_id": "rag-assistant",
+      "question": "According to the employee handbook, how many PTO days do employees receive per year?",
+      "expected": {
+        "tool_name": "Database_Search",
+        "tool_arguments": {},
+        "tool_content_contains": [
+          "Paid Time Off (PTO): 15 days per year"
+        ],
+        "answer_contains_all": ["15"],
+        "answer_contains_any": []
+      }
+    },
+    {
+      "id": "ticket-customer-001",
+      "category": "ticket",
+      "agent_id": "ticket-mcp-agent",
+      "question": "Use the get_customer_tickets tool for customer ID 1. List every ticket ID and status.",
+      "expected": {
+        "tool_name": "get_customer_tickets",
+        "tool_arguments": {
+          "customer_id": 1
+        },
+        "tool_content_contains": [
+          "\"ticket_count\": 3"
+        ],
+        "answer_contains_all": [
+          "1001",
+          "1002",
+          "1003",
+          "resolved",
+          "open"
+        ],
+        "answer_contains_any": []
+      }
+    },
+    {
+      "id": "ticket-repair-001",
+      "category": "ticket",
+      "agent_id": "ticket-mcp-agent",
+      "question": "Use the get_device_repair_history tool for device SN-ACME-1001. List its repair records.",
+      "expected": {
+        "tool_name": "get_device_repair_history",
+        "tool_arguments": {
+          "serial_number": "SN-ACME-1001"
+        },
+        "tool_content_contains": [
+          "\"repair_record_count\": 2"
+        ],
+        "answer_contains_all": [
+          "2",
+          "display cable",
+          "power adapter"
+        ],
+        "answer_contains_any": []
+      }
+    },
+    {
+      "id": "ticket-unknown-device-001",
+      "category": "no_answer",
+      "agent_id": "ticket-mcp-agent",
+      "question": "Use the get_device_repair_history tool for device SN-UNKNOWN-9999. Tell me what you find.",
+      "expected": {
+        "tool_name": "get_device_repair_history",
+        "tool_arguments": {
+          "serial_number": "SN-UNKNOWN-9999"
+        },
+        "tool_content_contains": [
+          "\"found\": false"
+        ],
+        "answer_contains_all": [],
+        "answer_contains_any": [
+          "not found",
+          "could not find",
+          "no device",
+          "no repair"
+        ]
+      }
+    }
+  ]
+}
