@@ -18,10 +18,10 @@ Phase 12：✅ 已完成（2026-09-01）
 Phase 13：✅ 已完成（2026-09-02）
 Phase 14：✅ 已完成（2026-09-02）
 Phase 15：✅ 已完成（2026-09-03）
-Phase 16：未开始
+Phase 16：✅ 已完成（2026-09-05）
 ```
 
-当前阶段边界：已经完成 FastAPI、Streamlit、SQLite、Qdrant、MCP、Docker Compose 和真实 Agent Evaluation。Phase 15 已完成规则评估、故障定位、超时治理和面试复盘；Phase 16 尚未开始。
+当前阶段边界：已经完成 FastAPI、Streamlit、SQLite、Qdrant、MCP、Docker Compose 和真实 Agent Evaluation，并完成项目 README、技术亮点、简历描述、项目介绍、工程边界与面试问答整理。Phase 1 至 Phase 16 已全部验收通过。
 
 ## 项目基线
 
@@ -1730,9 +1730,190 @@ ticket-unknown-device-001：PASS，76.06 秒
 - 改得动：能够增加 Case、调整规则、配置超时并读取 JSON 报告。
 - 会排错：能够根据工具、参数、工具内容和答案分数定位失败层级，并识别容器 Ollama 地址和客户端超时问题。
 
-## 下一阶段需要理解的内容
+## Phase 16：求职材料与项目表达
 
-Phase 16 开始求职整理：提炼项目亮点、架构说明、简历描述和面试讲解。当前尚未开始，不提前扩展。
+### 1. 项目定位
+
+本项目不是从零开发，而是基于 Joshua Carroll 的开源项目
+`agent-service-toolkit` 进行二次开发。原项目已经使用 LangGraph、FastAPI、
+Streamlit 和 Pydantic 搭建了动态 Agent 服务基础工程；本项目在理解原有架构和
+调用链后，完成了面向企业知识库和售后工单场景的改造。
+
+准确定位是：
+
+> 面向企业业务场景、可在本地运行的 AI Agent 工程原型。
+
+“企业场景”表示项目处理员工手册、客户、设备、工单和维修记录等企业数据；
+“企业级”则还要求高并发、高可用、权限、审计、监控、容灾和安全治理。当前项目
+不宣称已经达到企业生产级。
+
+### 2. 我的主要改造与核心能力
+
+两个概念需要严格区分：
+
+- **我的主要改造**：回答我在原项目基础上具体新增、替换或重构了什么。
+- **核心能力**：回答改造后的项目目前可以完成什么任务。
+
+我的主要改造包括：
+
+1. 将 Chroma + OpenAI Embedding 替换为 Qdrant + 本地 `bge-m3`。
+2. 增加 BGE Cross-Encoder Reranker，形成召回与精排链路。
+3. 设计 SQLite 客户、设备、工单和维修记录业务数据层。
+4. 开发 Ticket Tool、Ticket LangGraph Agent 和 Ticket MCP Server。
+5. 将新 Agent 接入动态注册表、FastAPI 通用路由和 Streamlit。
+6. 完成 Docker Compose 编排、数据挂载和 Checkpoint 持久化。
+7. 建立真实 Agent Evaluation，并针对失败结果完成链路排错。
+
+求职介绍重点突出三项核心能力：
+
+1. **企业 RAG 检索**：本地 Embedding、Qdrant Top-K、Reranker Top-N 和 Qwen 回答。
+2. **LangGraph Tool Calling + MCP**：模型选择工具、ToolMessage 回传、SQLite 精确查询，
+   以及 MCP 跨进程工具调用。
+3. **Docker 部署 + Evaluation**：服务编排、宿主机 Ollama、数据持久化，以及工具、
+   参数、结果、答案和延迟的分层评估。
+
+### 3. 为什么文档和业务数据使用不同链路
+
+```text
+员工手册等非结构化文档
+→ Embedding
+→ Qdrant 语义召回
+→ Reranker 精排
+→ Qwen 回答
+
+客户、设备、工单等结构化数据
+→ Tool Calling
+→ SQLite 精确查询
+→ ToolMessage
+→ Qwen 回答
+```
+
+RAG 解决“寻找语义相似内容”；SQL 工具解决“查询准确业务记录”。项目没有将所有
+数据都放入向量数据库，而是根据数据类型选择查询方式。
+
+### 4. 为什么保留两种工单工具调用方式
+
+```text
+ticket-assistant
+→ ToolNode
+→ 本地 Python Tool
+→ SQLite
+
+ticket-mcp-agent
+→ MCP Client
+→ stdio
+→ Ticket MCP Server 子进程
+→ SQLite
+```
+
+本地 Tool 结构简单、调用延迟低，适合同一进程中的小型服务；MCP 增加了通信层，
+但能够标准化工具接口，并让工具与 Agent 解耦、跨进程复用。两种实现不是让一次请求
+重复查询，而是展示本地工具调用与 MCP 工具服务两种架构及其取舍。真实项目可以根据
+规模和复用需求选择其中一种。
+
+### 5. 当前配置的能力边界
+
+- `qwen3:4b` 可以验证 Tool Calling 和回答链路，但复杂推理与工具选择稳定性有限。
+- `bge-m3` 已完成中英文向量检索验证；检索质量仍受文档数量、Chunk、Top-K、
+  Reranker 和阈值配置影响。
+- 当前 Qdrant 使用本地嵌入式存储，适合单机原型，不代表独立服务集群的并发与高可用。
+- 5/5 Evaluation 只证明当前五条 Case 在本次环境中通过，不能证明所有问题都正确。
+
+后续生产化方向可以包括：更强的语言模型、独立 Qdrant Server、更多评估集、相关性
+阈值、认证授权、日志监控、并发压测、高可用和备份恢复。
+
+### 6. Debug 案例表达方法
+
+面试时按照以下顺序说明问题：
+
+```text
+现象
+→ 排查过程
+→ 根本原因
+→ 解决方案
+→ 验证结果
+```
+
+三个代表性案例：
+
+1. **容器内 RAG 失败**：Evaluation 显示工具名称和参数正确，但工具内容失败；最终定位为
+   `OllamaEmbeddings` 没有读取 `OLLAMA_BASE_URL`，默认访问容器自己的
+   `localhost:11434`。传入 `settings.OLLAMA_BASE_URL` 后 RAG Case 通过。
+2. **Qdrant Client 生命周期**：创建 Retriever 不等于已经执行查询，真正访问 Qdrant
+   发生在 `retriever.invoke(query)`；因此必须在查询完成后再关闭 Client，并用
+   `try/finally` 保证异常时释放资源。
+3. **SSE 的 HTTP 200 判断**：HTTP 200 只表示请求或 SSE 连接建立，不能证明模型、工具和
+   数据库后续执行成功；还需要检查工具调用消息、对应的 ToolMessage、最终 AIMessage、
+   错误事件和 `[DONE]`。
+
+### 7. 简历项目描述
+
+**企业知识库与智能工单 Agent｜个人二次开发项目**
+
+- 基于开源 Agent Service Toolkit 进行企业场景二次开发，使用 LangGraph、FastAPI
+  和 Streamlit 构建支持动态 Agent、流式响应和多轮对话状态恢复的本地 AI Agent。
+- 将 Chroma 与 OpenAI Embedding 链路替换为本地 `bge-m3` 和 Qdrant，实现文档切分、
+  Top-K 向量召回与 Cross-Encoder Reranker 精排的企业 RAG 检索链路。
+- 设计客户、设备、工单和维修记录的 SQLite 数据模型，开发 Ticket Agent，并通过
+  Tool Calling 与 stdio MCP Server 实现结构化数据精确查询和跨进程工具调用。
+- 使用 Docker Compose 编排 Agent Service 和 Streamlit，处理宿主机 Ollama、数据挂载
+  与 Checkpoint 持久化；建立真实 Evaluation，当前五条基线 Case 全部通过。
+
+“5/5 Case 通过”只表示当前测试集通过率为 100%，不能写成“系统准确率达到 100%”。
+
+### 8. 一分钟项目介绍结构
+
+```text
+项目是什么
+→ 原项目与个人贡献边界
+→ RAG
+→ Tool Calling + MCP
+→ Docker + Evaluation
+→ 当前边界
+```
+
+介绍时明确这是开源项目二次开发，并将重点放在本人实际完成的企业场景改造。受个人
+硬件资源限制，当前使用本地轻量模型完成架构验证；不主动将其描述为企业生产级系统。
+
+### 9. 三分钟项目介绍结构
+
+三分钟版本在一分钟版本上增加以下技术细节：
+
+1. 非结构化文档与结构化业务数据为什么使用不同链路。
+2. Qdrant Top-K 召回与 Reranker Top-N 精排的职责和性能取舍。
+3. `AIMessage.tool_calls → ToolNode / MCP → ToolMessage → 第二次 model` 调用链。
+4. 本地 Tool 与 MCP Tool 的执行位置、耦合程度和适用场景。
+5. Checkpointer、`thread_id`、`user_id` 和 `business.db` 的职责边界。
+6. Bind Mount、Named Volume 和容器访问宿主机 Ollama 的方式。
+7. Evaluation 为什么需要检查中间过程，以及当前 5/5 基线的适用范围。
+
+介绍不需要逐字背诵，只记住“定位、边界、RAG、工具与 MCP、部署、评估、演进”七个
+关键词。面试官在中间追问时，应暂停主线并针对当前技术点回答。
+
+### 10. 生产化演进方向
+
+1. 使用更强的语言模型和独立推理服务，提高复杂推理与 Tool Calling 稳定性。
+2. 将本地嵌入式 Qdrant 升级为独立 Qdrant Server、集群或托管服务。
+3. 增加身份认证、RBAC、租户隔离、凭据管理和操作审计。
+4. 进行并发压测，完善连接池、缓存、限流、超时、重试和熔断。
+5. 增加结构化日志、指标、链路追踪、告警和模型调用观测。
+6. 建立业务数据库、向量库和 Checkpoint 的备份、迁移及恢复方案。
+7. 扩充正常、边界、异常、安全和性能 Evaluation Case，持续执行回归评估。
+
+### 11. 当前进度
+
+- README 已重写项目定位、主要改造、快速开始、架构、核心能力、API 示例和评估说明。
+- 已删除指向原作者仓库状态的 CI、CodeCov 和在线应用徽章。
+- 已保留原项目来源、原作者版权和 MIT License 说明。
+- 已完成简历描述、一分钟与三分钟介绍框架、技术难点、Debug 案例和生产化分析。
+- Phase 16 已由学习者确认完成，提交仍待完成。
+
+## Phase 16 四关验收
+
+- 看得懂：能够区分原项目基础框架、个人二次开发内容、项目能力和生产级能力边界。
+- 讲得清：能够围绕 RAG、LangGraph Tool Calling + MCP、Docker + Evaluation 介绍项目。
+- 改得动：能够判断 README 中“我的主要改造”和“核心能力”的不同职责，并调整求职表达。
+- 会排错：能够利用工具、参数、工具内容和最终答案的分层结果定位故障，并解释代表性 Debug 案例。
 
 ## 面试问题
 
@@ -1855,4 +2036,14 @@ Phase 16 开始求职整理：提炼项目亮点、架构说明、简历描述�
 4. `tool_pass`、`arguments_pass`、`tool_content_pass` 和 `answer_pass` 分别定位哪一层问题？
 5. 为什么失败 Case 也必须记录延迟，超时为什么应该根据运行环境配置？
 
-Phase 1 至 Phase 15 均已逐项学习并验收通过。
+### Phase 16
+
+1. 如何诚实说明原项目基础框架与个人二次开发内容的边界？
+2. 为什么员工手册使用 RAG，而工单业务数据使用 SQLite Tool Calling？
+3. 为什么采用 Qdrant Top-K 召回与 Cross-Encoder Reranker Top-N 精排？
+4. 本地 Tool 与 MCP Tool 的执行位置、性能、耦合程度和适用场景有什么区别？
+5. 为什么 Evaluation 需要分别评估工具、参数、工具内容和最终答案？
+6. 为什么当前 5/5 Case 通过不能描述成“系统准确率达到 100%”？
+7. 当前项目为什么应定位为企业场景工程原型，距离生产级还缺少哪些能力？
+
+Phase 1 至 Phase 16 均已逐项学习并验收通过。

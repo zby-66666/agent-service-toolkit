@@ -1,256 +1,261 @@
-# 🧰 AI Agent Service Toolkit
+# 企业知识库与智能工单 Agent
 
-[![build status](https://github.com/JoshuaC215/agent-service-toolkit/actions/workflows/test.yml/badge.svg)](https://github.com/JoshuaC215/agent-service-toolkit/actions/workflows/test.yml) [![codecov](https://codecov.io/github/JoshuaC215/agent-service-toolkit/graph/badge.svg?token=5MTJSYWD05)](https://codecov.io/github/JoshuaC215/agent-service-toolkit) [![Python Version](https://img.shields.io/python/required-version-toml?tomlFilePath=https%3A%2F%2Fraw.githubusercontent.com%2FJoshuaC215%2Fagent-service-toolkit%2Frefs%2Fheads%2Fmain%2Fpyproject.toml)](https://github.com/JoshuaC215/agent-service-toolkit/blob/main/pyproject.toml)
-[![GitHub License](https://img.shields.io/github/license/JoshuaC215/agent-service-toolkit)](https://github.com/JoshuaC215/agent-service-toolkit/blob/main/LICENSE) [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_red.svg)](https://agent-service-toolkit.streamlit.app/)
+**Enterprise Knowledge & Ticket Intelligence Agent**
 
-A full toolkit for running an AI agent service built with LangGraph, FastAPI and Streamlit.
+> 面向企业员工、客服和售后人员的本地 AI Agent，统一处理非结构化制度文档与结构化工单数据。
 
-It includes a [LangGraph](https://langchain-ai.github.io/langgraph/) agent, a [FastAPI](https://fastapi.tiangolo.com/) service to serve it, a client to interact with the service, and a [Streamlit](https://streamlit.io/) app that uses the client to provide a chat interface. Data structures and settings are built with [Pydantic](https://github.com/pydantic/pydantic).
+本仓库基于 Joshua Carroll 的开源项目
+[Agent Service Toolkit](https://github.com/JoshuaC215/agent-service-toolkit)
+进行二次开发，并继续遵循原项目的 MIT License。上游项目提供了
+LangGraph、FastAPI、Streamlit 和动态 Agent 服务框架；本项目重点完成企业知识库、
+工单业务、MCP、本地模型、容器化部署与质量评估等场景化改造。
 
-This project offers a template for you to easily build and run your own agents using the LangGraph framework. It demonstrates a complete setup from agent definition to user interface, making it easier to get started with LangGraph-based projects by providing a full, robust toolkit.
+## 项目概述
 
-**[🎥 Watch a video walkthrough of the repo and app](https://www.youtube.com/watch?v=pdYVHw_YCNY)**
+企业内部数据通常分为两类，本项目分别使用适合的数据链路进行处理：
 
-## Overview
+- 员工手册、制度文档属于非结构化长文本，通过本地 Embedding、Qdrant 和
+  Cross-Encoder Reranker 完成 RAG 检索，再由 Qwen 生成回答。
+- 客户、设备、工单和维修记录属于结构化业务数据，通过 SQLite 精确查询，并由
+  LangGraph Agent 使用 Tool Calling 或 MCP 调用业务工具。
 
-### [Try the app!](https://agent-service-toolkit.streamlit.app/)
+项目支持 FastAPI 流式与非流式接口、Streamlit 对话界面、基于 Checkpoint 的短期
+对话记忆、Docker Compose 部署，以及覆盖工具选择、检索内容、最终答案与延迟的真实
+Agent Evaluation。
 
-<a href="https://agent-service-toolkit.streamlit.app/"><img src="media/app_screenshot.png" width="600" alt="App screenshot"></a>
+## 我的主要改造
 
-### Quickstart
+- 将原有 Chroma + OpenAI Embedding 链路替换为 Qdrant + 本地 `bge-m3`。
+- 增加 BGE Cross-Encoder Reranker，对 Qdrant 候选 Chunk 进行精排。
+- 设计客户、设备、工单、维修记录的 SQLite 业务数据层及测试数据。
+- 开发 Ticket Tools、Ticket LangGraph Agent，以及基于 stdio 的 Ticket MCP Server。
+- 将 Ticket Agent 注册到通用 FastAPI 路由，并接入 Streamlit Agent 选择与历史对话。
+- 使用 Docker Compose 编排 Service、Streamlit、数据挂载和 Checkpoint 持久化。
+- 建立规则驱动的真实 Agent Evaluation，最终基线为 5/5 Case 通过。
 
-Run directly in python
+## 快速开始
 
-```sh
-# At least one LLM API key is required
-echo 'OPENAI_API_KEY=your_openai_api_key' >> .env
+以下命令以 Windows PowerShell 为例。首次运行需要安装：
 
-# uv is the recommended way to install agent-service-toolkit, but "pip install ." also works
-# For uv installation options, see: https://docs.astral.sh/uv/getting-started/installation/
-curl -LsSf https://astral.sh/uv/0.11.32/install.sh | sh
+- Python 3.12；
+- [uv](https://docs.astral.sh/uv/)；
+- [Ollama](https://ollama.com/)；
+- Docker Desktop 与 Docker Compose。
 
-# Install dependencies. "uv sync" creates .venv automatically
+### 1. 准备本地模型
+
+确保 Ollama 正在运行，然后安装聊天模型和向量模型：
+
+```powershell
+ollama pull qwen3:4b
+ollama pull bge-m3
+ollama list
+```
+
+`qwen3:4b` 负责工具选择、推理与回答；`bge-m3` 负责将文档 Chunk 和用户问题转换为向量。
+
+### 2. 安装项目依赖
+
+```powershell
+Copy-Item .env.example .env
 uv sync --frozen
-source .venv/bin/activate
-python src/run_service.py
-
-# In another shell
-source .venv/bin/activate
-streamlit run src/streamlit_app.py
 ```
 
-Run with docker
+至少在 `.env` 中设置：
 
-```sh
-echo 'OPENAI_API_KEY=your_openai_api_key' >> .env
-docker compose watch
+```env
+USE_FAKE_MODEL=false
+DEFAULT_MODEL=ollama
+OLLAMA_MODEL=qwen3:4b
+
+HOST=0.0.0.0
+PORT=8080
+
+DATABASE_TYPE=sqlite
+SQLITE_DB_PATH=checkpoints.db
+MODE=
 ```
 
-### Architecture Diagram
+本地开发不强制配置外部 LLM API Key。`AUTH_SECRET` 留空只适合本地开发；生产环境必须配置认证。
 
-<img src="media/agent_architecture.png" width="600" alt="Agent architecture diagram">
+### 3. 初始化业务数据库和向量库
 
-### Key Features
+仓库已经包含示例员工手册 `data/AcmeTech_Employee_Handbook.pdf`。首次运行时执行：
 
-1. **LangGraph Agent and latest features**: A customizable agent built using the LangGraph framework. Implements the latest LangGraph v1.0 features including human in the loop with `interrupt()`, flow control with `Command`, long-term memory with `Store`, and `langgraph-supervisor`.
-1. **FastAPI Service**: Serves the agent with both streaming and non-streaming endpoints.
-1. **Advanced Streaming**: A novel approach to support both token-based and message-based streaming.
-1. **AG-UI Protocol Support**: Every agent is also served over the [AG-UI protocol](https://docs.ag-ui.com) for connecting AG-UI compatible frontends like CopilotKit - see [docs](docs/AGUI.md).
-1. **Streamlit Interface**: Provides a user-friendly chat interface for interacting with the agent, including voice input and output.
-1. **Multiple Agent Support**: Run multiple agents in the service and call by URL path. Available agents and models are described in `/info`
-1. **Asynchronous Design**: Utilizes async/await for efficient handling of concurrent requests.
-1. **Content Moderation**: Implements Safeguard for content moderation (requires Groq API key).
-1. **RAG Agent**: A basic RAG agent implementation using ChromaDB - see [docs](docs/RAG_Assistant.md).
-1. **Chat History**: Lists a user's previous conversations per agent via `/threads`, with a "Previous Chats" sidebar in the Streamlit app.
-1. **Feedback Mechanism**: Includes a star-based feedback system integrated with LangSmith.
-1. **Docker Support**: Includes Dockerfiles and a docker compose file for easy development and deployment.
-1. **Testing**: Includes robust unit and integration tests for the full repo.
-
-### Key Files
-
-The repository is structured as follows:
-
-- `src/agents/`: Defines several agents with different capabilities
-- `src/schema/`: Defines the protocol schema
-- `src/core/`: Core modules including LLM definition and settings
-- `src/service/service.py`: FastAPI service to serve the agents
-- `src/client/client.py`: Client to interact with the agent service
-- `src/streamlit_app.py`: Streamlit app providing a chat interface
-- `tests/`: Unit and integration tests
-
-## Setup and Usage
-
-1. Clone the repository:
-
-   ```sh
-   git clone https://github.com/JoshuaC215/agent-service-toolkit.git
-   cd agent-service-toolkit
-   ```
-
-2. Set up environment variables:
-   Create a `.env` file in the root directory. At least one LLM API key or configuration is required. See the [`.env.example` file](./.env.example) for a full list of available environment variables, including a variety of model provider API keys, header-based authentication, LangSmith tracing, testing and development modes, and OpenWeatherMap API key.
-
-3. You can now run the agent service and the Streamlit app locally, either with Docker or just using Python. The Docker setup is recommended for simpler environment setup and immediate reloading of the services when you make changes to your code.
-
-### Additional setup for specific AI providers
-
-- [Setting up Ollama](docs/Ollama.md)
-- [Setting up VertexAI](docs/VertexAI.md)
-- [Setting up RAG with ChromaDB](docs/RAG_Assistant.md)
-
-### Building or customizing your own agent
-
-To customize the agent for your own use case:
-
-1. Add your new agent to the `src/agents` directory. You can copy `research_assistant.py` or `chatbot.py` and modify it to change the agent's behavior and tools.
-1. Import and add your new agent to the `agents` dictionary in `src/agents/agents.py`. Your agent can be called by `/<your_agent_name>/invoke` or `/<your_agent_name>/stream`.
-1. Adjust the Streamlit interface in `src/streamlit_app.py` to match your agent's capabilities.
-
-### Handling Private Credential files
-
-If your agents or chosen LLM require file-based credential files or certificates, the `privatecredentials/` has been provided for your development convenience. All contents, excluding the `.gitkeep` files, are ignored by git and docker's build process. See [Working with File-based Credentials](docs/File_Based_Credentials.md) for suggested use.
-
-### Docker Setup
-
-This project includes a Docker setup for easy development and deployment. The `compose.yaml` file defines three services: `postgres`, `agent_service` and `streamlit_app`. The `Dockerfile` for each service is in their respective directories.
-
-For local development, we recommend using [docker compose watch](https://docs.docker.com/compose/file-watch/). This feature allows for a smoother development experience by automatically updating your containers when changes are detected in your source code.
-
-1. Make sure you have Docker and Docker Compose (>= [v2.23.0](https://docs.docker.com/compose/release-notes/#2230)) installed on your system.
-
-2. Create a `.env` file from the `.env.example`. At minimum, you need to provide an LLM API key (e.g., OPENAI_API_KEY).
-
-   ```sh
-   cp .env.example .env
-   # Edit .env to add your API keys
-   ```
-
-3. Build and launch the services in watch mode:
-
-   ```sh
-   docker compose watch
-   ```
-
-   This will automatically:
-   - Start a PostgreSQL database service that the agent service connects to
-   - Start the agent service with FastAPI
-   - Start the Streamlit app for the user interface
-
-4. The services will now automatically update when you make changes to your code:
-   - Changes in the relevant python files and directories will trigger updates for the relevant services.
-   - NOTE: If you make changes to the `pyproject.toml` or `uv.lock` files, you will need to rebuild the services by running `docker compose up --build`.
-
-5. Access the Streamlit app by navigating to `http://localhost:8501` in your web browser.
-
-6. The agent service API will be available at `http://0.0.0.0:8080`. You can also use the OpenAPI docs at `http://0.0.0.0:8080/redoc`.
-
-7. Use `docker compose down` to stop the services.
-
-This setup allows you to develop and test your changes in real-time without manually restarting the services.
-
-### Building other apps on the AgentClient
-
-The repo includes a generic `src/client/client.AgentClient` that can be used to interact with the agent service. This client is designed to be flexible and can be used to build other apps on top of the agent. It supports both synchronous and asynchronous invocations, and streaming and non-streaming requests.
-
-See the `src/run_client.py` file for full examples of how to use the `AgentClient`. A quick example:
-
-```python
-from client import AgentClient
-client = AgentClient()
-
-response = client.invoke("Tell me a brief joke?")
-response.pretty_print()
-# ================================== Ai Message ==================================
-#
-# A man walked into a library and asked the librarian, "Do you have any books on Pavlov's dogs and Schrödinger's cat?"
-# The librarian replied, "It rings a bell, but I'm not sure if it's here or not."
-
+```powershell
+uv run python scripts/create_business_db.py
+uv run python scripts/seed_business_db.py
+uv run python scripts/create_qdrant_db.py
 ```
 
-### Development with LangGraph Studio
+脚本会创建：
 
-The agent supports [LangGraph Studio](https://langchain-ai.github.io/langgraph/concepts/langgraph_studio/), the IDE for developing agents in LangGraph.
+- `data/business.db`：客户、设备、工单和维修记录；
+- `qdrant_data/`：员工手册 Chunk 的本地向量数据；
+- `employee_handbook`：Qdrant 中保存员工手册向量的 Collection。
 
-`langgraph-cli[inmem]` is installed with `uv sync`. You can simply add your `.env` file to the root directory as described above, and then launch LangGraph Studio with `langgraph dev`. Customize `langgraph.json` as needed. See the [local quickstart](https://langchain-ai.github.io/langgraph/cloud/how-tos/studio/quick_start/#local-development-server) to learn more.
+建库脚本会拒绝覆盖已有数据库或 Collection，避免重复写入和误删数据。
 
-### Local development without Docker
+### 4. 使用 Docker Compose 启动
 
-You can also run the agent service and the Streamlit app locally without Docker, just using a Python virtual environment.
-
-1. Create a virtual environment and install dependencies:
-
-   ```sh
-   uv sync --frozen
-   source .venv/bin/activate
-   ```
-
-2. Run the FastAPI server:
-
-   ```sh
-   python src/run_service.py
-   ```
-
-3. In a separate terminal, run the Streamlit app:
-
-   ```sh
-   streamlit run src/streamlit_app.py
-   ```
-
-4. Open your browser and navigate to the URL provided by Streamlit (usually `http://localhost:8501`).
-
-## Projects built with or inspired by agent-service-toolkit
-
-The following are a few of the public projects that drew code or inspiration from this repo.
-
-- **[PolyRAG](https://github.com/QuentinFuxa/PolyRAG)** - Extends agent-service-toolkit with RAG capabilities over both PostgreSQL databases and PDF documents.
-- **[alexrisch/agent-web-kit](https://github.com/alexrisch/agent-web-kit)** - A Next.JS frontend for agent-service-toolkit
-- **[raushan-in/dapa](https://github.com/raushan-in/dapa)** - Digital Arrest Protection App (DAPA) enables users to report financial scams and frauds efficiently via a user-friendly platform.
-
-**Please create a pull request editing the README or open a discussion with any new ones to be added!** Would love to include more projects.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-**A note on how this repo is maintained:** this is a solo-maintainer project, and issues, PRs, and discussions are triaged on a roughly biweekly cycle with help from an AI maintenance agent. Thanks for your patience if responses take a week or two — I will do my best to respond to truly urgent issues (vulnerability reports, etc.) or in-progress PRs within a few days. The full automation playbooks are versioned in [`docs/maintenance/`](docs/maintenance/) if you're curious how it works.
-
-Currently the tests need to be run using the local development without Docker setup. To run the tests for the agent service:
-
-1. Ensure you're in the project root directory and have activated your virtual environment.
-
-2. Install the development dependencies and pre-commit hooks:
-
-   ```sh
-   uv sync --frozen
-   pre-commit install
-   ```
-
-3. Run the tests using pytest:
-
-   ```sh
-   pytest
-   ```
-
-### Smoke testing optional dependencies
-
-Some integrations aren't exercised by the unit suite or the default CI run because they
-need real infrastructure: the Postgres and MongoDB checkpointers, the AG-UI endpoint, and
-LangFuse tracing. `scripts/smoke_test.sh` spins up each dependency in Docker, runs the
-service against it, verifies the integration end-to-end (including a check that the
-intended backend was actually used, not a silent SQLite fallback), and tears it down.
-
-```sh
-./scripts/smoke_test.sh                 # default: postgres, mongo, agui
-./scripts/smoke_test.sh mongo           # a single target
-./scripts/smoke_test.sh langfuse        # heavy: starts LangFuse's full self-host stack
-./scripts/smoke_test.sh all             # everything, including langfuse
+```powershell
+docker compose up -d --build
+docker compose ps
 ```
 
-These are opt-in confidence checks for a maintainer or agent — not part of CI. Run the
-target that matches what you changed rather than the whole set. The optional add-on
-compose files live in `docker/` (e.g. `docker/compose.mongo.yaml`), layered on top of the
-default `compose.yaml` so the default stack stays lightweight.
+Compose 中的 Agent Service 使用 `host.docker.internal:11434` 访问 Windows 宿主机上的 Ollama。
 
-## License
+启动完成后访问：
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+- FastAPI 健康检查：<http://localhost:8080/health>
+- FastAPI 服务信息：<http://localhost:8080/info>
+- Streamlit：<http://localhost:8501>
+
+停止容器：
+
+```powershell
+docker compose down
+```
+
+`docker compose down` 默认保留 Checkpoint Named Volume；执行 `docker compose down --volumes` 会同时删除持久化的对话状态。
+
+### 5. 不使用 Docker 启动
+
+先在一个 PowerShell 窗口启动服务端：
+
+```powershell
+uv run python src/run_service.py
+```
+
+再在另一个 PowerShell 窗口启动 Streamlit：
+
+```powershell
+uv run streamlit run src/streamlit_app.py
+```
+
+## 系统架构
+
+```mermaid
+flowchart LR
+    User[企业员工 / 客服 / 售后人员] --> UI[Streamlit]
+    UI --> Client[AgentClient]
+    Client --> API[FastAPI<br/>invoke / stream / history]
+    Eval[Evaluation Runner] --> API
+
+    API --> Registry[动态 Agent 注册表]
+    API --> Checkpoint[(SQLite Checkpoint)]
+
+    Registry --> RAG[RAG Assistant]
+    Registry --> Ticket[Ticket Assistant]
+    Registry --> MCPAgent[Ticket MCP Agent]
+
+    RAG -->|调用模型并接收 AIMessage| Qwen[Ollama / Qwen3 4B]
+    Ticket -->|调用模型并接收 AIMessage| Qwen
+    MCPAgent -->|调用模型并接收 AIMessage| Qwen
+
+    RAG --> Search[Database_Search]
+    Search --> Embedding[bge-m3 Embedding]
+    Embedding --> Qdrant[(Qdrant<br/>employee_handbook)]
+    Qdrant --> Reranker[BGE Reranker]
+    Reranker -->|检索上下文 / ToolMessage| RAG
+
+    Ticket --> LocalTools[Ticket Tools]
+    LocalTools --> Queries[Business Queries]
+
+    MCPAgent --> MCPClient[MCP Client]
+    MCPClient -->|stdio| MCPServer[Ticket MCP Server]
+    MCPServer --> Queries
+
+    Queries --> BusinessDB[(SQLite<br/>business.db)]
+    RAG -->|最终 State| API
+    Ticket -->|最终 State| API
+    MCPAgent -->|最终 State| API
+```
+
+两条核心数据链路分别是：
+
+```text
+RAG：用户问题 → 第一次 Qwen → Database_Search → bge-m3 → Qdrant Top-K → Reranker Top-N → ToolMessage → 第二次 Qwen
+工单：用户问题 → 第一次 Qwen → Tool Calling → 本地 Tool 或 MCP → SQLite → ToolMessage → 第二次 Qwen
+```
+
+`checkpoints.db` 保存 LangGraph 对话 State；`business.db` 保存客户、设备、工单和维修记录，二者职责分离。
+
+## 核心能力
+
+1. **企业 RAG 检索**：加载并切分 PDF、DOCX 文档，使用本地 `bge-m3` 完成向量化，通过 Qdrant Top-K 召回候选 Chunk，再使用 BGE Cross-Encoder Reranker 精排，最终由 Qwen 基于检索上下文回答。
+2. **LangGraph Tool Calling + MCP**：针对客户、设备、工单和维修记录等结构化数据，由 LangGraph 根据 `AIMessage.tool_calls` 路由本地 Tool 或 MCP Tool，通过 SQLite 获得准确数据，再将 `ToolMessage` 交给模型生成最终答案；MCP 版本支持通过 stdio 跨进程发现和调用工具。
+3. **Docker 部署 + Evaluation**：使用 Docker Compose 编排 FastAPI Agent Service 和 Streamlit，处理宿主机 Ollama 访问、业务数据挂载与 Checkpoint 持久化；真实 Evaluation 分层检查工具选择、参数、工具结果、最终答案和端到端延迟。
+
+项目还提供动态 Agent 注册、invoke/stream/history/threads 接口、SSE 流式响应、Streamlit Agent 选择，以及按 `thread_id` 隔离的短期对话记忆。
+
+## 核心目录
+
+| 路径 | 职责 |
+| --- | --- |
+| `src/agents/` | LangGraph Agent、Ticket Tools 和 MCP Agent |
+| `src/business/` | SQLite 业务查询与数据访问层 |
+| `src/mcp_servers/` | 基于 stdio 的 Ticket MCP Server |
+| `src/core/` | 模型创建、运行配置和全局 Settings |
+| `src/service/` | FastAPI 路由、Agent 调用与 SSE 响应编排 |
+| `src/client/` | invoke、stream、history 等服务客户端 |
+| `scripts/` | 业务建库、种子数据、查询验证和 Qdrant 建库脚本 |
+| `evals/` | 真实 Agent Case、事件收集、规则评分与报告生成 |
+| `tests/` | 单元测试、协议集成测试和真实 Graph 服务测试 |
+| `compose.yaml` | Service、Streamlit、数据挂载和持久化编排 |
+
+## API 调用示例
+
+服务启动后，可以直接通过动态 Agent 路由调用 Ticket MCP Agent：
+
+```powershell
+$body = @{
+    message = "Use the get_customer_tickets tool for customer ID 1. List every ticket ID and status."
+    thread_id = "readme-ticket-demo"
+    user_id = "readme-demo-user"
+} | ConvertTo-Json
+
+$response = Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://localhost:8080/ticket-mcp-agent/invoke" `
+    -ContentType "application/json" `
+    -Body $body
+
+$response.content
+```
+
+复用相同 `thread_id` 可以继续同一段对话；使用新的 `thread_id` 会创建相互隔离的 Graph State。
+
+## 测试与质量评估
+
+运行自动化测试：
+
+```powershell
+uv run pytest
+```
+
+自动化测试主要使用 Fake Model、Mock 和临时数据库验证确定性代码，不要求真实 Qwen 每次生成完全相同的文本。
+
+在 Ollama、Agent Service、业务数据库和 Qdrant 均可用时，运行真实 Agent Evaluation：
+
+```powershell
+uv run python evals/run_evaluation.py --timeout-seconds 600
+```
+
+Evaluation 会分别记录：
+
+- 工具是否选择正确；
+- 工具参数是否正确；
+- 工具结果是否包含预期事实；
+- 最终答案是否包含关键事实；
+- 每条 Case 的端到端延迟。
+
+当前本地基线为 5/5 Case 通过。该结果仅表示当前样例在本次运行环境中通过，不代表所有问题都能正确回答。
+
+更完整的学习、实现和 Debug 记录见 [`PROJECT_NOTES.md`](PROJECT_NOTES.md)。
+
+## 开源来源与许可证
+
+本项目基于 [JoshuaC215/agent-service-toolkit](https://github.com/JoshuaC215/agent-service-toolkit) 进行二次开发。
+
+原项目与本项目均遵循 [MIT License](LICENSE)。仓库保留原作者的版权和许可证声明；本 README 中的“我的主要改造”专门说明了本项目在原有框架基础上新增或重构的内容。
